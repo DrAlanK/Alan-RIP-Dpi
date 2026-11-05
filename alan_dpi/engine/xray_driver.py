@@ -1,349 +1,262 @@
-import atexit
+import random
 import base64
-import ctypes
-import hashlib
+import concurrent.futures
 import json
 import os
+import re
 import socket
 import subprocess
-import threading
+import tempfile
 import time
 import urllib.parse
-from typing import Callable, Dict, Optional, Tuple
-from alan_dpi.engine.models import EngineSettings, ProfileNode
+from typing import Dict, List, Optional, Tuple
 
-try:
-    import winreg
-except ImportError:
-    winreg = None
-
-
-TLS_DEFAULT_PORTS = (443, 2053, 2083, 2087, 2096, 8443)
+from alan_dpi.engine.bridge import FullDuplexMutatorBridge
+from alan_dpi.engine.clean_ip import CleanIpScanner
+from alan_dpi.engine.models import EngineSettings, ProfileNode, find_vector
+from alan_dpi.engine.verifier import TunnelStreamVerifier
 
 
-def _is_truthy_param(val: str) -> bool:
-    return str(val or "").strip().lower() in ("1", "true", "yes", "on")
+DIRECT_IR_DOMAINS = [
+    "domain:ir",
+    "domain:local",
+    "domain:shaparak.ir",
+    "domain:digikala.com",
+    "domain:snapp.ir",
+    "domain:aparat.com",
+    "domain:divar.ir",
+    "domain:telewebion.com",
+    "domain:torob.com",
+    "domain:zarinpal.com",
+]
+
+PRIVATE_CIDRS = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+]
 
 
-class SystemProxyController:
-    @staticmethod
-    def apply(enable: bool, http_port: int = 10809):
-        if os.name != "nt" or winreg is None:
-            return
+def _b64_decode_padded(raw: str) -> str:
+    clean = (raw or "").strip().replace("-", "+").replace("_", "/")
+    pad = (-len(clean)) % 4
+    if pad:
+        clean += "=" * pad
+    return base64.b64decode(clean).decode("utf-8", errors="ignore")
+
+
+def _b64_encode_nopad(raw: str) -> str:
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def find_free_tcp_port(preferred: int = 0) -> int:
+    if preferred > 0:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_WRITE) as key:
-                if enable:
-                    winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
-                    winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, f"127.0.0.1:{http_port}")
-                    winreg.SetValueEx(
-                        key,
-                        "ProxyOverride",
-                        0,
-                        winreg.REG_SZ,
-                        "localhost;127.*;10.*;192.168.*;198.18.*;<local>",
-                    )
-                else:
-                    winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
-
-            try:
-                ctypes.windll.wininet.InternetSetOptionW(0, 39, 0, 0)
-                ctypes.windll.wininet.InternetSetOptionW(0, 37, 0, 0)
-            except Exception:
-                pass
-        except Exception:
+            s.bind(("127.0.0.1", int(preferred)))
+            return int(preferred)
+        except OSError:
             pass
-
-
-atexit.register(SystemProxyController.apply, False)
+        finally:
+            s.close()
+    s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s2.bind(("127.0.0.1", 0))
+        return int(s2.getsockname()[1])
+    finally:
+        s2.close()
 
 
 class UriConfigCodec:
-    @staticmethod
-    def _decode_ss_components(uri: str) -> Tuple[str, str, str, int, str]:
-        parsed = urllib.parse.urlsplit(uri.strip())
-        remark = urllib.parse.unquote(parsed.fragment) if parsed.fragment else ""
-        raw_netloc = parsed.netloc
+    SUPPORTED_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "socks://")
 
-        user_info = ""
-        host_port = ""
-        if "@" in raw_netloc:
-            raw_user, host_port = raw_netloc.rsplit("@", 1)
-            unquoted_user = urllib.parse.unquote(raw_user)
-            if ":" in unquoted_user:
-                user_info = unquoted_user
-            else:
-                padded = unquoted_user + ("=" * ((4 - (len(unquoted_user) % 4)) % 4))
-                try:
-                    user_info = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
-                except Exception:
-                    user_info = unquoted_user
-        else:
-            b64_part = urllib.parse.unquote(raw_netloc)
-            padded = b64_part + ("=" * ((4 - (len(b64_part) % 4)) % 4))
-            dec = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
-            if "@" in dec:
-                user_info, host_port = dec.rsplit("@", 1)
-
-        if ":" in user_info:
-            method, password = user_info.split(":", 1)
-        else:
-            method, password = "chacha20-ietf-poly1305", user_info
-
-        host_port = host_port.split("/")[0].strip()
-        if host_port.startswith("[") and "]:" in host_port:
-            r_host, port_str = host_port[1:].split("]:", 1)
-        elif ":" in host_port:
-            r_host, port_str = host_port.rsplit(":", 1)
-        else:
-            r_host, port_str = (parsed.hostname or ""), str(parsed.port or 443)
-
-        r_port = int(port_str)
-        return method.strip(), password, r_host.strip(), r_port, (remark or r_host.strip())
-
-    @staticmethod
-    def _build_http_tcp_settings(host_header: str, path_str: str) -> Dict:
-        hosts = [h.strip() for h in (host_header or "").split(",") if h.strip()]
-        paths = [p.strip() for p in (path_str or "/").split(",") if p.strip()] or ["/"]
-        req_headers = {
-            "User-Agent": [
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-            ],
-            "Accept-Encoding": ["gzip, deflate"],
-            "Connection": ["keep-alive"],
-            "Pragma": "no-cache",
-        }
-        if hosts:
-            req_headers["Host"] = hosts
-        return {
-            "header": {
-                "type": "http",
-                "request": {
-                    "version": "1.1",
-                    "method": "GET",
-                    "path": paths,
-                    "headers": req_headers,
-                },
-            }
-        }
-
-    @staticmethod
-    def replace_endpoint_ip(uri: str, new_ip: str) -> str:
-        uri = uri.strip()
-        new_ip = new_ip.strip()
-        if not uri or not new_ip:
-            return uri
-
-        if uri.startswith(("vless://", "trojan://")):
-            parsed = urllib.parse.urlsplit(uri)
-            user = parsed.username or ""
-            port = parsed.port or 443
-            params = urllib.parse.parse_qs(parsed.query)
-            orig_host = parsed.hostname or ""
-            if orig_host and (not orig_host.replace(".", "").isdigit()):
-                if ("sni" not in params) and (params.get("security", [""])[0] in ("tls", "reality")):
-                    params["sni"] = [orig_host]
-                if "host" not in params:
-                    params["host"] = [orig_host]
-            new_query = urllib.parse.urlencode(params, doseq=True)
-            new_netloc = f"{user}@{new_ip}:{port}"
-            return urllib.parse.urlunsplit((parsed.scheme, new_netloc, parsed.path, new_query, parsed.fragment))
-
-        if uri.startswith("vmess://"):
+    @classmethod
+    def extract_uris_from_blob(cls, text: str) -> List[str]:
+        raw = (text or "").strip()
+        if not raw:
+            return []
+        if "://" not in raw:
             try:
-                b64 = uri[8:] + ("=" * ((4 - (len(uri[8:]) % 4)) % 4))
-                v_data = json.loads(base64.b64decode(b64).decode("utf-8"))
-                orig_add = v_data.get("add", "")
-                if orig_add and (not orig_add.replace(".", "").isdigit()):
-                    if (not v_data.get("sni")) and (v_data.get("tls") == "tls"):
-                        v_data["sni"] = orig_add
-                    if not v_data.get("host"):
-                        v_data["host"] = orig_add
-                v_data["add"] = new_ip
-                encoded = base64.b64encode(json.dumps(v_data, ensure_ascii=False).encode("utf-8")).decode("ascii")
-                return f"vmess://{encoded}"
+                decoded = _b64_decode_padded(raw)
+                if "://" in decoded:
+                    raw = decoded
             except Exception:
-                return uri
+                pass
+        results: List[str] = []
+        for line in raw.splitlines():
+            item = line.strip()
+            if any(item.lower().startswith(sch) for sch in cls.SUPPORTED_SCHEMES):
+                results.append(item)
+        return results
 
-        return uri
+    @classmethod
+    def parse_editable_fields(cls, node: ProfileNode) -> dict:
+        ed = cls.parse_to_editable(
+            node.uri,
+            uid=node.uid,
+            group_tag=node.group_tag,
+            preferred_vec=node.cached_vector_id or "AUTO",
+        )
+        if node.cached_clean_ip:
+            ed["address"] = node.cached_clean_ip
+        return ed
 
-    @staticmethod
-    def update_remark(uri: str, new_remark: str) -> str:
-        uri = uri.strip()
-        new_remark = new_remark.strip()
-        if uri.startswith(("vless://", "trojan://", "ss://")):
-            parsed = urllib.parse.urlsplit(uri)
-            return urllib.parse.urlunsplit(
-                (parsed.scheme, parsed.netloc, parsed.path, parsed.query, urllib.parse.quote(new_remark))
-            )
-        if uri.startswith("vmess://"):
-            try:
-                b64 = uri[8:] + ("=" * ((4 - (len(uri[8:]) % 4)) % 4))
-                v_data = json.loads(base64.b64decode(b64).decode("utf-8"))
-                v_data["ps"] = new_remark
-                encoded = base64.b64encode(json.dumps(v_data, ensure_ascii=False).encode("utf-8")).decode("ascii")
-                return f"vmess://{encoded}"
-            except Exception:
-                return uri
-        return uri
-
-    @staticmethod
-    def parse_editable_fields(node: ProfileNode) -> dict:
-        uri = node.uri.strip()
+    @classmethod
+    def parse_to_editable(cls, uri: str, uid: str = "", group_tag: str = "Manual", preferred_vec: str = "AUTO") -> dict:
+        clean_uri = (uri or "").strip()
+        lower = clean_uri.lower()
         base = {
-            "uid": node.uid,
-            "name": node.name,
-            "group_tag": node.group_tag,
+            "uid": uid,
+            "name": "Profile",
+            "group_tag": group_tag,
             "protocol": "vless",
-            "address": node.cached_clean_ip or node.original_host,
-            "port": int(node.port),
+            "address": "",
+            "port": 443,
             "uuid_or_password": "",
-            "network": "ws",
+            "network": "tcp",
             "header_type": "none",
-            "security": "tls",
+            "security": "none",
             "allow_insecure": False,
-            "sni": node.sni,
-            "host_header": node.sni,
+            "sni": "",
+            "host_header": "",
             "path": "/",
-            "alpn": "http/1.1",
+            "alpn": "",
             "fingerprint": "chrome",
             "flow": "",
             "pbk": "",
             "sid": "",
             "scy": "auto",
-            "preferred_vector_id": node.cached_vector_id or "AUTO",
-            "raw_uri": uri,
+            "preferred_vector_id": preferred_vec or "AUTO",
+            "raw_uri": clean_uri,
+            "use_raw_uri": False,
         }
 
-        if uri.startswith(("vless://", "trojan://")):
-            parsed = urllib.parse.urlsplit(uri)
-            params = urllib.parse.parse_qs(parsed.query)
-            port = parsed.port or 443
-            default_sec = "tls" if port in TLS_DEFAULT_PORTS else "none"
-            sec = params.get("security", [default_sec])[0]
-            net = params.get("type", ["ws" if uri.startswith("vless://") else "tcp"])[0]
-            hdr_type = params.get("headerType", ["none"])[0]
-            sni = params.get("sni", [parsed.hostname or ""])[0].split("#mut=")[0]
-            host_hdr = params.get("host", [sni])[0]
-            path_val = (
-                params.get("serviceName", [params.get("path", ["/"])[0]])[0]
-                if net == "grpc"
-                else params.get("path", ["/"])[0]
-            )
-            insec = _is_truthy_param(params.get("allowInsecure", ["0"])[0]) or _is_truthy_param(
-                params.get("insecure", ["0"])[0]
-            )
-            base.update({
-                "protocol": "vless" if uri.startswith("vless://") else "trojan",
-                "address": parsed.hostname or node.original_host,
-                "port": int(port),
-                "uuid_or_password": urllib.parse.unquote(parsed.username or ""),
-                "network": net,
-                "header_type": hdr_type,
-                "security": sec,
-                "allow_insecure": insec,
-                "sni": sni,
-                "host_header": host_hdr,
-                "path": path_val,
-                "alpn": params.get("alpn", ["http/1.1"])[0],
-                "fingerprint": params.get("fp", ["chrome"])[0],
-                "flow": params.get("flow", [""])[0],
-                "pbk": params.get("pbk", [""])[0],
-                "sid": params.get("sid", [""])[0],
-                "scy": params.get("encryption", ["none"])[0],
-            })
-        elif uri.startswith("vmess://"):
-            try:
-                b64 = uri[8:] + ("=" * ((4 - (len(uri[8:]) % 4)) % 4))
-                v = json.loads(base64.b64decode(b64).decode("utf-8"))
-                base.update({
-                    "protocol": "vmess",
-                    "address": v.get("add", node.original_host),
-                    "port": int(v.get("port", 443)),
-                    "uuid_or_password": v.get("id", ""),
-                    "network": v.get("net", "ws"),
-                    "header_type": v.get("type", "none"),
-                    "security": v.get("tls") if v.get("tls") in ("tls", "reality") else "none",
-                    "allow_insecure": _is_truthy_param(str(v.get("allowInsecure", "0"))),
-                    "sni": v.get("sni") or v.get("host") or v.get("add", ""),
-                    "host_header": v.get("host") or v.get("sni") or "",
-                    "path": v.get("path") or "/",
-                    "alpn": v.get("alpn", "http/1.1"),
-                    "fingerprint": v.get("fp", "chrome"),
-                    "scy": v.get("scy", "auto"),
-                })
-            except Exception:
-                pass
-        elif uri.startswith("ss://"):
-            method, password, r_host, r_port, _ = UriConfigCodec._decode_ss_components(uri)
+        if lower.startswith("vmess://"):
+            body = clean_uri[8:]
+            if "#" in body:
+                body, frag = body.split("#", 1)
+                base["name"] = urllib.parse.unquote(frag) or "VMess"
+            data = json.loads(_b64_decode_padded(body))
+            base["protocol"] = "vmess"
+            base["name"] = str(data.get("ps") or base["name"] or "VMess")
+            base["address"] = str(data.get("add") or "").strip()
+            base["port"] = int(data.get("port") or 443)
+            base["uuid_or_password"] = str(data.get("id") or "").strip()
+            base["scy"] = str(data.get("scy") or "auto")
+            base["network"] = str(data.get("net") or "tcp").lower()
+            base["header_type"] = str(data.get("type") or "none").lower()
+            tls_val = str(data.get("tls") or "").lower()
+            base["security"] = "tls" if tls_val == "tls" else "none"
+            base["allow_insecure"] = str(data.get("allowInsecure") or "0").lower() in ("1", "true")
+            base["sni"] = str(data.get("sni") or data.get("host") or "").strip()
+            base["host_header"] = str(data.get("host") or "").strip()
+            base["path"] = str(data.get("path") or "/")
+            base["alpn"] = str(data.get("alpn") or "")
+            base["fingerprint"] = str(data.get("fp") or "chrome")
+            return base
+
+        if lower.startswith("ss://"):
+            body = clean_uri[5:]
+            name = "Shadowsocks"
+            if "#" in body:
+                body, frag = body.split("#", 1)
+                name = urllib.parse.unquote(frag) or name
+            if "?" in body:
+                body = body.split("?", 1)[0]
+            if "@" in body:
+                userinfo, hostport = body.rsplit("@", 1)
+                userinfo = urllib.parse.unquote(userinfo)
+                if ":" not in userinfo:
+                    userinfo = _b64_decode_padded(userinfo)
+            else:
+                decoded_all = _b64_decode_padded(body)
+                userinfo, hostport = decoded_all.rsplit("@", 1)
+            method, password = userinfo.split(":", 1)
+            host, port_s = hostport.rsplit(":", 1)
             base.update({
                 "protocol": "ss",
-                "address": r_host,
-                "port": r_port,
+                "name": name,
+                "address": host.strip("[]"),
+                "port": int(port_s),
+                "scy": method.strip(),
                 "uuid_or_password": password,
-                "scy": method,
-                "network": "tcp",
                 "security": "none",
             })
+            return base
 
+        parsed = urllib.parse.urlsplit(clean_uri)
+        proto = parsed.scheme.lower()
+        q = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+        name = urllib.parse.unquote(parsed.fragment) if parsed.fragment else proto.upper()
+        user_val = urllib.parse.unquote(parsed.username or "")
+        if (proto == "socks") and (not parsed.password) and user_val:
+            try:
+                dec_u = _b64_decode_padded(user_val)
+                if ":" in dec_u:
+                    user_val = dec_u
+            except Exception:
+                pass
+        elif parsed.password:
+            user_val = f"{user_val}:{urllib.parse.unquote(parsed.password)}"
+
+        sec = (q.get("security") or ("tls" if proto == "trojan" else "none")).lower()
+        net = (q.get("type") or "tcp").lower()
+        sni_val = (q.get("sni") or q.get("peer") or q.get("host") or "").strip()
+        if (not sni_val) and (sec == "tls") and parsed.hostname:
+            sni_val = parsed.hostname
+
+        insecure_raw = str(q.get("allowInsecure") or q.get("insecure") or "0").strip().lower()
+        base.update({
+            "protocol": proto,
+            "name": name,
+            "address": (parsed.hostname or "").strip(),
+            "port": int(parsed.port or 443),
+            "uuid_or_password": user_val,
+            "network": net,
+            "header_type": (q.get("headerType") or "none").lower(),
+            "security": sec,
+            "allow_insecure": insecure_raw in ("1", "true"),
+            "sni": sni_val,
+            "host_header": (q.get("host") or q.get("authority") or "").strip(),
+            "path": q.get("path") or q.get("serviceName") or "/",
+            "alpn": q.get("alpn") or "",
+            "fingerprint": q.get("fp") or "chrome",
+            "flow": q.get("flow") or "",
+            "pbk": q.get("pbk") or "",
+            "sid": q.get("sid") or "",
+            "scy": q.get("encryption") or "none",
+        })
         return base
 
-    @staticmethod
-    def build_uri_from_editable(fields: dict) -> str:
-        proto = str(fields.get("protocol", "vless")).lower().strip()
-        name = str(fields.get("name", "Profile")).strip() or "Profile"
-        addr = str(fields.get("address", "")).strip()
-        port = int(fields.get("port", 443) or 443)
-        secret = str(fields.get("uuid_or_password", "")).strip()
-        net = str(fields.get("network", "ws")).strip() or "ws"
-        hdr_type = str(fields.get("header_type", "none")).strip() or "none"
-        sec = str(fields.get("security", "tls")).strip() or "none"
-        insec = bool(fields.get("allow_insecure", False))
-        sni = str(fields.get("sni", "")).strip()
-        host_hdr = str(fields.get("host_header", "")).strip()
-        path_val = str(fields.get("path", "/")).strip() or "/"
-        alpn = str(fields.get("alpn", "http/1.1")).strip()
-        fp = str(fields.get("fingerprint", "chrome")).strip()
-        flow = str(fields.get("flow", "")).strip()
-        pbk = str(fields.get("pbk", "")).strip()
-        sid = str(fields.get("sid", "")).strip()
-        scy = str(fields.get("scy", "auto")).strip()
+    @classmethod
+    def build_uri_from_editable(cls, fields: dict, inject_early_data: int = 0) -> str:
+        if fields.get("use_raw_uri") and fields.get("raw_uri"):
+            return str(fields["raw_uri"]).strip()
 
-        if not addr:
-            raise ValueError("Server address cannot be empty.")
+        proto = str(fields.get("protocol") or "vless").lower()
+        name = str(fields.get("name") or "Profile").strip()
+        addr = str(fields.get("address") or "").strip()
+        port = int(fields.get("port") or 443)
+        secret = str(fields.get("uuid_or_password") or "").strip()
+        net = str(fields.get("network") or "tcp").lower()
+        htype = str(fields.get("header_type") or "none").lower()
+        sec = str(fields.get("security") or "none").lower()
+        sni = str(fields.get("sni") or "").strip()
+        host_h = str(fields.get("host_header") or "").strip()
+        path = str(fields.get("path") or "/")
+        alpn = str(fields.get("alpn") or "").strip()
+        fp = str(fields.get("fingerprint") or "chrome").strip()
 
-        if proto in ("vless", "trojan"):
-            q = {"type": net, "security": sec}
-            if hdr_type != "none":
-                q["headerType"] = hdr_type
-            if proto == "vless":
-                q["encryption"] = scy if (scy and scy != "auto") else "none"
-                if flow:
-                    q["flow"] = flow
-            if net == "grpc":
-                q["serviceName"] = path_val
-            else:
-                q["path"] = path_val
-                if host_hdr:
-                    q["host"] = host_hdr
-            if sec in ("tls", "reality"):
-                if sni:
-                    q["sni"] = sni
-                if fp:
-                    q["fp"] = fp
-                if alpn and (sec == "tls"):
-                    q["alpn"] = alpn
-                if insec and (sec == "tls"):
-                    q["allowInsecure"] = "1"
-                if sec == "reality":
-                    if pbk:
-                        q["pbk"] = pbk
-                    if sid:
-                        q["sid"] = sid
-            query_str = urllib.parse.urlencode(q)
-            return f"{proto}://{urllib.parse.quote(secret)}@{addr}:{port}?{query_str}#{urllib.parse.quote(name)}"
+        if (inject_early_data > 0) and (net in ("ws", "httpupgrade")) and ("ed=" not in path):
+            sep = "&" if ("?" in path) else "?"
+            path = f"{path}{sep}ed={int(inject_early_data)}"
 
         if proto == "vmess":
+            scy_val = str(fields.get("scy") or "auto")
+            if scy_val not in ("auto", "aes-128-gcm", "chacha20-poly1305", "none", "zero"):
+                scy_val = "auto"
             v_obj = {
                 "v": "2",
                 "ps": name,
@@ -351,512 +264,807 @@ class UriConfigCodec:
                 "port": str(port),
                 "id": secret,
                 "aid": "0",
-                "scy": scy or "auto",
+                "scy": scy_val,
                 "net": net,
-                "type": hdr_type,
-                "host": host_hdr,
-                "path": path_val,
+                "type": htype,
+                "host": host_h,
+                "path": path,
                 "tls": "tls" if sec == "tls" else "",
                 "sni": sni,
                 "alpn": alpn,
                 "fp": fp,
             }
-            if insec:
-                v_obj["allowInsecure"] = 1
-            enc = base64.b64encode(json.dumps(v_obj, ensure_ascii=False).encode("utf-8")).decode("ascii")
-            return f"vmess://{enc}"
+            return "vmess://" + base64.b64encode(json.dumps(v_obj, ensure_ascii=False).encode("utf-8")).decode("ascii")
 
-        if proto in ("ss", "shadowsocks"):
-            method = scy if (scy and scy not in ("none", "auto")) else "chacha20-ietf-poly1305"
-            userinfo = base64.urlsafe_b64encode(f"{method}:{secret}".encode("utf-8")).decode("ascii").rstrip("=")
-            return f"ss://{userinfo}@{addr}:{port}#{urllib.parse.quote(name)}"
+        if proto == "ss":
+            method = str(fields.get("scy") or "chacha20-ietf-poly1305")
+            if method in ("auto", "none", ""):
+                method = "chacha20-ietf-poly1305"
+            enc_user = _b64_encode_nopad(f"{method}:{secret}")
+            return f"ss://{enc_user}@{addr}:{port}#{urllib.parse.quote(name)}"
 
-        raise ValueError(f"Unsupported protocol: {proto}")
+        params: Dict[str, str] = {"type": net, "security": sec}
+        if proto == "vless":
+            params["encryption"] = "none"
+            if fields.get("flow"):
+                params["flow"] = str(fields["flow"])
+        if htype and (htype != "none"):
+            params["headerType"] = htype
+        if host_h:
+            params["host"] = host_h
+        if net in ("ws", "httpupgrade", "xhttp", "splithttp"):
+            params["path"] = path
+        elif net == "grpc":
+            params["serviceName"] = path.lstrip("/")
+        if sec in ("tls", "reality"):
+            if sni:
+                params["sni"] = sni
+            if fp:
+                params["fp"] = fp
+            if alpn:
+                params["alpn"] = alpn
+            if sec == "tls" and fields.get("allow_insecure"):
+                params["allowInsecure"] = "1"
+            if sec == "reality":
+                if fields.get("pbk"):
+                    params["pbk"] = str(fields["pbk"])
+                if fields.get("sid"):
+                    params["sid"] = str(fields["sid"])
 
-    @staticmethod
-    def build_exportable_uri(node: ProfileNode, inject_early_data: int = 0) -> str:
-        out_uri = node.uri
-        if node.cached_clean_ip:
-            out_uri = UriConfigCodec.replace_endpoint_ip(out_uri, node.cached_clean_ip)
-        if (inject_early_data > 0) and out_uri.startswith("vless://"):
-            parsed = urllib.parse.urlsplit(out_uri)
-            params = urllib.parse.parse_qs(parsed.query)
-            if params.get("type", ["ws"])[0] == "ws":
-                cur_path = params.get("path", ["/"])[0]
-                if "ed=" not in cur_path:
-                    sep = "&" if "?" in cur_path else "?"
-                    params["path"] = [f"{cur_path}{sep}ed={inject_early_data}"]
-                    new_q = urllib.parse.urlencode(params, doseq=True)
-                    out_uri = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_q, parsed.fragment))
-        return UriConfigCodec.update_remark(out_uri, node.name)
+        q_str = urllib.parse.urlencode(params)
+        return f"{proto}://{urllib.parse.quote(secret)}@{addr}:{port}?{q_str}#{urllib.parse.quote(name)}"
 
-    @staticmethod
-    def extract_profile_node(uri: str, group_tag: str = "Manual") -> ProfileNode:
-        _, meta = UriConfigCodec.compile_xray_config(uri)
+    @classmethod
+    def extract_profile_node(cls, uri: str, group_tag: str = "Manual", is_hidden: bool = False) -> ProfileNode:
+        ed = cls.parse_to_editable(uri, group_tag=group_tag)
+        proto_map = {
+            "vless": "VLESS",
+            "vmess": "VMess",
+            "trojan": "Trojan",
+            "ss": "Shadowsocks",
+            "socks": "SOCKS",
+        }
+        proto_label = proto_map.get(ed["protocol"], ed["protocol"].upper())
         return ProfileNode(
             uri=uri.strip(),
-            name=meta["name"],
-            protocol=meta["protocol"],
-            original_host=meta["remote_host"],
-            port=int(meta["remote_port"]),
-            sni=meta["sni"],
+            name=ed["name"],
+            protocol=proto_label,
+            original_host=ed["address"],
+            port=int(ed["port"]),
+            sni=ed["sni"],
             group_tag=group_tag,
+            is_hidden_pool=is_hidden,
         )
 
-    @staticmethod
-    def _apply_early_data_path(ws_path: str, early_data: int) -> str:
-        if (early_data <= 0) or ("ed=" in ws_path):
-            return ws_path
-        sep = "&" if "?" in ws_path else "?"
-        return f"{ws_path}{sep}ed={early_data}"
-
-    @staticmethod
-    def compile_xray_config(
+    @classmethod
+    def build_xray_outbound(
+        cls,
         uri: str,
-        settings: Optional[EngineSettings] = None,
-        use_native_fragment: bool = False,
-        socks_port_override: Optional[int] = None,
-        http_port_override: Optional[int] = None,
-    ) -> Tuple[Dict, Dict]:
-        cfg = settings or EngineSettings()
-        s_port = int(socks_port_override or cfg.socks_port)
-        h_port = int(http_port_override or cfg.http_port)
-        uri = uri.strip()
+        settings: EngineSettings,
+        target_host: str = "127.0.0.1",
+        target_port: int = 20809,
+        tag: str = "proxy-out",
+        dialer_proxy: str = "",
+        strip_allow_insecure: bool = False,
+    ) -> dict:
+        ed = cls.parse_to_editable(uri)
+        proto = ed["protocol"]
 
-        inbounds = [
-            {
-                "tag": "socks-in",
-                "port": s_port,
-                "listen": "127.0.0.1",
-                "protocol": "socks",
-                "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True},
-                "settings": {"auth": "noauth", "udp": True},
-            },
-            {
-                "tag": "http-in",
-                "port": h_port,
-                "listen": "127.0.0.1",
-                "protocol": "http",
-                "settings": {},
-            },
-        ]
-
-        base_sockopt: Dict = {
-            "tcpKeepAliveInterval": 15,
-            "tcpKeepAliveIdle": 11,
-            "tcpNoDelay": True,
-        }
-        if use_native_fragment and cfg.fragment_enabled:
-            base_sockopt["dialerProxy"] = "fragment-out"
-
-        mux_block = {"enabled": bool(cfg.mux_enabled), "concurrency": int(cfg.mux_concurrency)}
-
-        def _resolve_alpn(default_list):
-            if cfg.alpn_override and (cfg.alpn_override != "auto"):
-                return [x.strip() for x in cfg.alpn_override.split(",") if x.strip()]
-            return default_list
-
-        outbound: Dict = {}
-        meta: Dict = {}
-
-        if uri.startswith("vless://"):
-            parsed = urllib.parse.urlsplit(uri)
-            uuid_val = urllib.parse.unquote(parsed.username or "")
-            remote_host = parsed.hostname or ""
-            remote_port = parsed.port or 443
-            params = urllib.parse.parse_qs(parsed.query)
-
-            default_sec = "tls" if remote_port in TLS_DEFAULT_PORTS else "none"
-            security = params.get("security", [default_sec])[0]
-            network = params.get("type", ["tcp"])[0]
-            header_type = params.get("headerType", ["none"])[0]
-            clean_sni = params.get("sni", [params.get("host", [remote_host])[0]])[0].split("#mut=")[0].strip()
-            ws_host = params.get("host", [clean_sni])[0].strip()
-            raw_path = params.get("path", ["/"])[0].strip() or "/"
-            ws_path = UriConfigCodec._apply_early_data_path(raw_path, cfg.ws_early_data)
-            alpn_raw = params.get("alpn", [""])[0]
-            alpn_default = ["http/1.1"] if network in ("ws", "httpupgrade") else ["h2", "http/1.1"]
-            alpn_list = _resolve_alpn([x.strip() for x in alpn_raw.split(",") if x.strip()] or alpn_default)
-            allow_insecure = _is_truthy_param(params.get("allowInsecure", ["0"])[0]) or _is_truthy_param(
-                params.get("insecure", ["0"])[0]
-            )
-            pbk = params.get("pbk", [""])[0]
-            sid = params.get("sid", [""])[0]
-            spx = params.get("spx", [""])[0]
-            flow = params.get("flow", [""])[0]
-            encryption = params.get("encryption", ["none"])[0] or "none"
-            fp_val = params.get("fp", [cfg.fingerprint])[0] or cfg.fingerprint
-
-            stream_settings: Dict = {"network": network, "security": security, "sockopt": base_sockopt}
-            if (network == "tcp") and (header_type == "http"):
-                stream_settings["tcpSettings"] = UriConfigCodec._build_http_tcp_settings(ws_host, raw_path)
-            elif network == "ws":
-                stream_settings["wsSettings"] = {"path": ws_path, "headers": {"Host": ws_host} if ws_host else {}}
-            elif network == "httpupgrade":
-                stream_settings["httpupgradeSettings"] = {"path": ws_path, "host": ws_host}
-            elif network in ("xhttp", "splithttp"):
-                key_name = "xhttpSettings" if network == "xhttp" else "splithttpSettings"
-                stream_settings[key_name] = {
-                    "path": raw_path,
-                    "host": ws_host,
-                    "mode": params.get("mode", ["auto"])[0],
-                }
-            elif network == "grpc":
-                stream_settings["grpcSettings"] = {
-                    "serviceName": params.get("serviceName", [""])[0],
-                    "multiMode": (params.get("mode", ["gun"])[0] == "multi"),
-                }
-
-            if security == "tls":
-                stream_settings["tlsSettings"] = {
-                    "serverName": clean_sni,
-                    "allowInsecure": allow_insecure,
-                    "alpn": alpn_list,
-                    "fingerprint": cfg.fingerprint or fp_val,
-                }
-            elif security == "reality":
-                stream_settings["realitySettings"] = {
-                    "serverName": clean_sni,
-                    "publicKey": pbk,
-                    "shortId": sid,
-                    "spiderX": spx,
-                    "fingerprint": fp_val,
-                }
-
-            outbound = {
-                "tag": "proxy",
-                "protocol": "vless",
-                "settings": {
-                    "vnext": [
-                        {
-                            "address": "127.0.0.1",
-                            "port": cfg.bridge_port,
-                            "users": [{"id": uuid_val, "encryption": encryption, "flow": flow}],
-                        }
-                    ]
-                },
-                "streamSettings": stream_settings,
+        if proto == "vless":
+            user_obj = {"id": ed["uuid_or_password"], "encryption": "none"}
+            if ed["flow"]:
+                user_obj["flow"] = ed["flow"]
+            out_settings = {"vnext": [{"address": target_host, "port": int(target_port), "users": [user_obj]}]}
+            out_proto = "vless"
+        elif proto == "vmess":
+            scy_val = ed["scy"] if ed["scy"] in ("auto", "aes-128-gcm", "chacha20-poly1305", "none", "zero") else "auto"
+            user_obj = {"id": ed["uuid_or_password"], "alterId": 0, "security": scy_val}
+            out_settings = {"vnext": [{"address": target_host, "port": int(target_port), "users": [user_obj]}]}
+            out_proto = "vmess"
+        elif proto == "trojan":
+            out_settings = {"servers": [{"address": target_host, "port": int(target_port), "password": ed["uuid_or_password"]}]}
+            out_proto = "trojan"
+        elif proto == "ss":
+            ss_method = ed["scy"] if (ed["scy"] and ed["scy"] not in ("auto", "none")) else "chacha20-ietf-poly1305"
+            out_settings = {
+                "servers": [{
+                    "address": target_host,
+                    "port": int(target_port),
+                    "method": ss_method,
+                    "password": ed["uuid_or_password"],
+                }]
             }
-            if cfg.mux_enabled and (not flow):
-                outbound["mux"] = mux_block
-
-            display_sni = ws_host if ((security == "none") and ws_host) else clean_sni
-            meta = {
-                "protocol": "VLESS",
-                "name": urllib.parse.unquote(parsed.fragment) if parsed.fragment else remote_host,
-                "remote_host": remote_host,
-                "remote_port": remote_port,
-                "sni": display_sni,
-                "security": security,
-            }
-
-        elif uri.startswith("vmess://"):
-            b64 = uri[8:] + ("=" * ((4 - (len(uri[8:]) % 4)) % 4))
-            v_data = json.loads(base64.b64decode(b64).decode("utf-8"))
-
-            remote_host = v_data.get("add", "")
-            remote_port = int(v_data.get("port", 443))
-            clean_sni = v_data.get("sni") or v_data.get("host") or remote_host
-            ws_host = v_data.get("host") or clean_sni
-            raw_path = v_data.get("path") or "/"
-            ws_path = UriConfigCodec._apply_early_data_path(raw_path, cfg.ws_early_data)
-            network = v_data.get("net", "tcp")
-            header_type = v_data.get("type", "none")
-            raw_tls = str(v_data.get("tls", "")).lower()
-            security = "tls" if raw_tls == "tls" else "none"
-            allow_insecure = _is_truthy_param(str(v_data.get("allowInsecure", "0"))) or (
-                v_data.get("verify_cert") is False
-            )
-
-            stream_settings = {"network": network, "security": security, "sockopt": base_sockopt}
-            if (network == "tcp") and (header_type == "http"):
-                stream_settings["tcpSettings"] = UriConfigCodec._build_http_tcp_settings(ws_host, raw_path)
-            elif network == "ws":
-                stream_settings["wsSettings"] = {"path": ws_path, "headers": {"Host": ws_host} if ws_host else {}}
-            elif network == "grpc":
-                stream_settings["grpcSettings"] = {"serviceName": raw_path}
-
-            if security == "tls":
-                stream_settings["tlsSettings"] = {
-                    "serverName": clean_sni,
-                    "allowInsecure": allow_insecure,
-                    "alpn": _resolve_alpn(["http/1.1"] if network == "ws" else ["h2", "http/1.1"]),
-                    "fingerprint": cfg.fingerprint,
-                }
-
-            outbound = {
-                "tag": "proxy",
-                "protocol": "vmess",
-                "settings": {
-                    "vnext": [
-                        {
-                            "address": "127.0.0.1",
-                            "port": cfg.bridge_port,
-                            "users": [
-                                {
-                                    "id": v_data.get("id"),
-                                    "alterId": int(v_data.get("aid", 0)),
-                                    "security": v_data.get("scy") or "auto",
-                                }
-                            ],
-                        }
-                    ]
-                },
-                "streamSettings": stream_settings,
-                "mux": mux_block,
-            }
-            meta = {
-                "protocol": "VMess",
-                "name": v_data.get("ps") or remote_host,
-                "remote_host": remote_host,
-                "remote_port": remote_port,
-                "sni": clean_sni,
-                "security": security,
-            }
-
-        elif uri.startswith("trojan://"):
-            parsed = urllib.parse.urlsplit(uri)
-            password = urllib.parse.unquote(parsed.username or "")
-            remote_host = parsed.hostname or ""
-            remote_port = parsed.port or 443
-            params = urllib.parse.parse_qs(parsed.query)
-
-            security = params.get("security", ["tls"])[0]
-            network = params.get("type", ["tcp"])[0]
-            header_type = params.get("headerType", ["none"])[0]
-            clean_sni = params.get("sni", [remote_host])[0].split("#mut=")[0].strip()
-            ws_host = params.get("host", [clean_sni])[0].strip()
-            raw_path = params.get("path", ["/"])[0].strip() or "/"
-            ws_path = UriConfigCodec._apply_early_data_path(raw_path, cfg.ws_early_data)
-            alpn_raw = params.get("alpn", [""])[0]
-            alpn_default = ["http/1.1"] if network == "ws" else ["h2", "http/1.1"]
-            alpn_list = _resolve_alpn([x.strip() for x in alpn_raw.split(",") if x.strip()] or alpn_default)
-            allow_insecure = _is_truthy_param(params.get("allowInsecure", ["0"])[0]) or _is_truthy_param(
-                params.get("insecure", ["0"])[0]
-            )
-
-            stream_settings = {"network": network, "security": security, "sockopt": base_sockopt}
-            if (network == "tcp") and (header_type == "http"):
-                stream_settings["tcpSettings"] = UriConfigCodec._build_http_tcp_settings(ws_host, raw_path)
-            elif network == "ws":
-                stream_settings["wsSettings"] = {"path": ws_path, "headers": {"Host": ws_host} if ws_host else {}}
-            elif network == "grpc":
-                stream_settings["grpcSettings"] = {"serviceName": params.get("serviceName", [""])[0]}
-
-            if security == "tls":
-                stream_settings["tlsSettings"] = {
-                    "serverName": clean_sni,
-                    "allowInsecure": allow_insecure,
-                    "alpn": alpn_list,
-                    "fingerprint": cfg.fingerprint,
-                }
-            elif security == "reality":
-                stream_settings["realitySettings"] = {
-                    "serverName": clean_sni,
-                    "publicKey": params.get("pbk", [""])[0],
-                    "shortId": params.get("sid", [""])[0],
-                    "fingerprint": cfg.fingerprint,
-                }
-
-            outbound = {
-                "tag": "proxy",
-                "protocol": "trojan",
-                "settings": {
-                    "servers": [{"address": "127.0.0.1", "port": cfg.bridge_port, "password": password}]
-                },
-                "streamSettings": stream_settings,
-                "mux": mux_block,
-            }
-            meta = {
-                "protocol": "Trojan",
-                "name": urllib.parse.unquote(parsed.fragment) if parsed.fragment else remote_host,
-                "remote_host": remote_host,
-                "remote_port": remote_port,
-                "sni": clean_sni,
-                "security": security,
-            }
-
-        elif uri.startswith("ss://"):
-            method, password, remote_host, remote_port, remark_name = UriConfigCodec._decode_ss_components(uri)
-            outbound = {
-                "tag": "proxy",
-                "protocol": "shadowsocks",
-                "settings": {
-                    "servers": [
-                        {
-                            "address": "127.0.0.1",
-                            "port": cfg.bridge_port,
-                            "method": method,
-                            "password": password,
-                            "uot": True,
-                        }
-                    ]
-                },
-                "streamSettings": {"network": "tcp", "security": "none", "sockopt": base_sockopt},
-            }
-            meta = {
-                "protocol": "Shadowsocks",
-                "name": remark_name,
-                "remote_host": remote_host,
-                "remote_port": remote_port,
-                "sni": remote_host,
-                "security": "none",
-            }
+            out_proto = "shadowsocks"
         else:
-            raise ValueError("Unsupported protocol URI (allowed: vless, vmess, trojan, ss).")
+            srv: dict = {"address": target_host, "port": int(target_port)}
+            if ":" in ed["uuid_or_password"]:
+                u, p = ed["uuid_or_password"].split(":", 1)
+                srv["users"] = [{"user": u, "pass": p}]
+            out_settings = {"servers": [srv]}
+            out_proto = "socks"
 
-        outbounds = [outbound]
-        if use_native_fragment and cfg.fragment_enabled:
-            outbounds.append({
-                "tag": "fragment-out",
-                "protocol": "freedom",
-                "settings": {
-                    "fragment": {
-                        "packets": cfg.fragment_packets.strip() or "tlshello",
-                        "length": cfg.fragment_length.strip() or "5-16",
-                        "interval": cfg.fragment_interval.strip() or "2-3",
-                    }
-                },
-                "streamSettings": {"sockopt": {"tcpNoDelay": True}},
-            })
+        net = ed["network"]
+        if net == "splithttp":
+            net = "xhttp"
 
-        return {"log": {"loglevel": "warning"}, "inbounds": inbounds, "outbounds": outbounds}, meta
+        stream: dict = {"network": net, "security": ed["security"]}
+        path_val = ed["path"] or "/"
+        if (settings.ws_early_data > 0) and (net in ("ws", "httpupgrade")) and ("ed=" not in path_val):
+            sep = "&" if ("?" in path_val) else "?"
+            path_val = f"{path_val}{sep}ed={int(settings.ws_early_data)}"
+
+        host_hdr = ed["host_header"] or ed["sni"] or ed["address"]
+
+        if net == "ws":
+            ws_cfg: dict = {"path": path_val}
+            if host_hdr:
+                ws_cfg["host"] = host_hdr
+            stream["wsSettings"] = ws_cfg
+        elif net == "httpupgrade":
+            hu_cfg: dict = {"path": path_val}
+            if host_hdr:
+                hu_cfg["host"] = host_hdr
+            stream["httpupgradeSettings"] = hu_cfg
+        elif net == "xhttp":
+            xh_cfg: dict = {"path": path_val, "mode": "auto"}
+            if host_hdr:
+                xh_cfg["host"] = host_hdr
+            stream["xhttpSettings"] = xh_cfg
+        elif net == "grpc":
+            grpc_cfg: dict = {"serviceName": path_val.lstrip("/"), "multiMode": False}
+            if host_hdr:
+                grpc_cfg["authority"] = host_hdr
+            stream["grpcSettings"] = grpc_cfg
+        elif net == "kcp":
+            stream["kcpSettings"] = {"seed": path_val.lstrip("/"), "header": {"type": ed["header_type"] or "none"}}
+        elif (net == "tcp") and (ed["header_type"] == "http"):
+            stream["tcpSettings"] = {
+                "header": {
+                    "type": "http",
+                    "request": {
+                        "version": "1.1",
+                        "method": "GET",
+                        "path": [path_val],
+                        "headers": {
+                            "Host": [host_hdr] if host_hdr else ["www.speedtest.net"],
+                            "User-Agent": ["Mozilla/5.0 Chrome/131.0.0.0"],
+                            "Connection": ["keep-alive"],
+                        },
+                    },
+                }
+            }
+
+        raw_fp_pref = (settings.fingerprint or "custom_poly").strip().lower()
+        if raw_fp_pref in ("custom_poly", "custom", "polymorphic", "auto"):
+            if ed["security"] == "reality":
+                fp = random.choice(("safari", "ios", "edge"))
+            else:
+                fp = random.choice(("random", "safari", "ios", "edge", "qq"))
+        else:
+            fp = raw_fp_pref or ed["fingerprint"] or "random"
+        alpn_raw = settings.alpn_override if (settings.alpn_override and settings.alpn_override != "auto") else ed["alpn"]
+        alpn_list = [x.strip() for x in alpn_raw.split(",") if x.strip()] if alpn_raw else []
+        if (not alpn_list) and (net in ("ws", "httpupgrade")) and (ed["security"] == "tls"):
+            alpn_list = ["http/1.1"]
+
+        if ed["security"] == "tls":
+            tls_cfg: dict = {
+                "serverName": ed["sni"] or host_hdr or ed["address"],
+                "fingerprint": fp,
+            }
+            if alpn_list:
+                tls_cfg["alpn"] = alpn_list
+            if bool(ed["allow_insecure"]) and (not strip_allow_insecure):
+                tls_cfg["allowInsecure"] = True
+            stream["tlsSettings"] = tls_cfg
+        elif ed["security"] == "reality":
+            stream["realitySettings"] = {
+                "serverName": ed["sni"] or ed["address"],
+                "fingerprint": fp,
+                "publicKey": ed["pbk"],
+                "shortId": ed["sid"],
+                "spiderX": "/",
+            }
+
+        sockopt: dict = {"tcpNoDelay": True}
+        if dialer_proxy:
+            sockopt["dialerProxy"] = dialer_proxy
+        stream["sockopt"] = sockopt
+
+        outbound = {
+            "tag": tag,
+            "protocol": out_proto,
+            "settings": out_settings,
+            "streamSettings": stream,
+        }
+        if settings.mux_enabled and (ed["security"] != "reality") and (net != "xhttp"):
+            outbound["mux"] = {"enabled": True, "concurrency": max(1, int(settings.mux_concurrency))}
+        return outbound
 
 
 class XrayProcessDriver:
-    def __init__(self, core_dir: str, configs_dir: str, log_fn: Optional[Callable[[str], None]] = None):
+    _cached_major_ver: Optional[int] = None
+
+    def __init__(self, core_dir: str, configs_dir: str, log_fn=None):
         self.core_dir = core_dir
         self.configs_dir = configs_dir
+        self.log_fn = log_fn
         self.proc: Optional[subprocess.Popen] = None
-        self._active_digest: str = ""
-        self._lock = threading.Lock()
-        self._log_fn = log_fn
+        self.active_socks_port: int = 10808
+        self.active_http_port: int = 10809
+        self._native_tun_supported: Optional[bool] = None
+        self._temp_cfg_file: str = ""
+        self._temp_log_file: str = ""
 
-    def _log(self, msg: str):
-        if self._log_fn:
-            self._log_fn(msg)
+    def _log(self, text: str):
+        if self.log_fn is not None:
+            self.log_fn(text)
 
     @property
-    def is_running(self) -> bool:
-        return (self.proc is not None) and (self.proc.poll() is None)
+    def xray_exe_path(self) -> str:
+        name = "xray.exe" if os.name == "nt" else "xray"
+        return os.path.join(self.core_dir, name)
 
-    @staticmethod
-    def _is_port_free(port: int) -> bool:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    def _detect_xray_major_version(self) -> int:
+        if XrayProcessDriver._cached_major_ver is not None:
+            return XrayProcessDriver._cached_major_ver
+        exe = self.xray_exe_path
+        if not os.path.exists(exe):
+            return 25
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            res = subprocess.run([exe, "version"], capture_output=True, text=True, timeout=2.5, creationflags=flags)
+            m = re.search(r"Xray\s+(\d+)\.", res.stdout or "")
+            if m:
+                XrayProcessDriver._cached_major_ver = int(m.group(1))
+                return XrayProcessDriver._cached_major_ver
+        except Exception:
+            pass
+        XrayProcessDriver._cached_major_ver = 25
+        return 25
+
+    def supports_native_tun(self) -> bool:
+        if self._native_tun_supported is not None:
+            return self._native_tun_supported
+        exe = self.xray_exe_path
+        if not os.path.exists(exe):
+            return False
+        probe_cfg = {
+            "log": {"loglevel": "none"},
+            "inbounds": [{"tag": "t", "protocol": "tun", "settings": {"name": "AlanProbe", "MTU": 1400}}],
+            "outbounds": [{"tag": "d", "protocol": "freedom"}],
+        }
+        tmp_path = os.path.join(self.configs_dir, "_probe_tun.json")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(probe_cfg, fh)
+            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            res = subprocess.run([exe, "run", "-test", "-c", tmp_path], capture_output=True, timeout=3.0, creationflags=flags)
+            self._native_tun_supported = res.returncode == 0
+        except Exception:
+            self._native_tun_supported = False
+        finally:
             try:
-                s.bind(("127.0.0.1", int(port)))
-                return True
-            except OSError:
-                return False
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return bool(self._native_tun_supported)
 
-    @classmethod
-    def _allocate_port(cls, preferred: int, excluded: set) -> int:
-        if (preferred not in excluded) and cls._is_port_free(preferred):
-            return int(preferred)
-        for candidate in range(20810, 20960):
-            if (candidate not in excluded) and cls._is_port_free(candidate):
-                return candidate
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            return int(s.getsockname()[1])
+    def _build_routing_and_dns(self, settings: EngineSettings, physical_nic_alias: str = "") -> Tuple[dict, list, dict]:
+        has_geosite = os.path.exists(os.path.join(self.core_dir, "geosite.dat"))
+        has_geoip = os.path.exists(os.path.join(self.core_dir, "geoip.dat"))
+
+        custom_direct = [x.strip() for x in (settings.custom_direct_domains or "").replace("\n", ",").split(",") if x.strip()]
+        custom_proxy = [x.strip() for x in (settings.custom_proxy_domains or "").replace("\n", ",").split(",") if x.strip()]
+        custom_block = [x.strip() for x in (settings.custom_blocked_domains or "").replace("\n", ",").split(",") if x.strip()]
+
+        ir_domains = list(DIRECT_IR_DOMAINS)
+
+        dns_cfg = {
+            "servers": [
+                settings.remote_dns or "1.1.1.1",
+                {
+                    "address": settings.domestic_dns or "178.22.122.100",
+                    "domains": ir_domains,
+                },
+            ]
+        }
+
+        direct_outbound: dict = {"tag": "direct-out", "protocol": "freedom"}
+        if physical_nic_alias:
+            direct_outbound["streamSettings"] = {"sockopt": {"interface": physical_nic_alias}}
+
+        extra_outbounds = [
+            direct_outbound,
+            {"tag": "block-out", "protocol": "blackhole"},
+        ]
+
+        rules: List[dict] = []
+        if settings.block_quic:
+            rules.append({"type": "field", "network": "udp", "port": "443", "outboundTag": "block-out"})
+
+        if custom_block:
+            rules.append({"type": "field", "domain": custom_block, "outboundTag": "block-out"})
+        elif has_geosite and (settings.routing_mode != "global"):
+            rules.append({"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block-out"})
+
+        if custom_proxy:
+            rules.append({"type": "field", "domain": custom_proxy, "outboundTag": "proxy-out"})
+
+        if custom_direct:
+            rules.append({"type": "field", "domain": custom_direct, "outboundTag": "direct-out"})
+
+        rules.append({"type": "field", "ip": list(PRIVATE_CIDRS), "outboundTag": "direct-out"})
+
+        if settings.routing_mode == "bypass_ir":
+            rules.append({"type": "field", "domain": ir_domains, "outboundTag": "direct-out"})
+            if has_geoip:
+                rules.append({"type": "field", "ip": ["geoip:ir", "geoip:private"], "outboundTag": "direct-out"})
+
+        routing_cfg = {
+            "domainStrategy": "IPIfNonMatch",
+            "rules": rules,
+        }
+        return dns_cfg, extra_outbounds, routing_cfg
+
+    def _spawn_and_wait(self, exe: str, cfg_path: str, log_path: str, http_p: int) -> Tuple[bool, str]:
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        with open(log_path, "w", encoding="utf-8", errors="ignore") as log_fh:
+            self.proc = subprocess.Popen(
+                [exe, "run", "-c", cfg_path],
+                cwd=self.core_dir,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                creationflags=flags,
+            )
+
+        deadline = time.perf_counter() + 3.5
+        while time.perf_counter() < deadline:
+            if self.proc.poll() is not None:
+                err_txt = ""
+                try:
+                    with open(log_path, "r", encoding="utf-8", errors="ignore") as rfh:
+                        lines = [ln.strip() for ln in rfh.read().splitlines() if ln.strip()]
+                        err_txt = " | ".join(lines[-3:])[:260]
+                except Exception:
+                    pass
+                return False, (err_txt or f"ExitCode={self.proc.returncode}")
+
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.15)
+            try:
+                s.connect(("127.0.0.1", http_p))
+                return True, ""
+            except Exception:
+                time.sleep(0.05)
+            finally:
+                s.close()
+
+        return True, ""
 
     def ensure_running(
         self,
         uri: str,
         settings: EngineSettings,
         use_native_fragment: bool = False,
-    ) -> Dict:
-        xray_doc, meta = UriConfigCodec.compile_xray_config(
-            uri=uri,
-            settings=settings,
-            use_native_fragment=use_native_fragment,
-        )
-        serialized = json.dumps(xray_doc, sort_keys=True, indent=2)
-        digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-
-        with self._lock:
-            if self.is_running and (digest == self._active_digest):
-                return meta
+        direct_remote_host: str = "",
+        direct_remote_port: int = 0,
+        enable_native_tun_inbound: bool = False,
+        physical_nic_alias: str = "",
+        is_probe_mode: bool = False,
+    ) -> Tuple[int, int]:
+        exe = self.xray_exe_path
+        if not os.path.exists(exe):
+            raise FileNotFoundError(f"Xray binary missing at {exe}")
 
         self.stop()
 
-        reserved = {int(settings.bridge_port)}
-        free_socks = self._allocate_port(int(settings.socks_port), reserved)
-        reserved.add(free_socks)
-        free_http = self._allocate_port(int(settings.http_port), reserved)
+        is_lab = bool(is_probe_mode) or (int(settings.bridge_port) >= 21000)
+        socks_p = find_free_tcp_port(settings.socks_port)
+        http_p = find_free_tcp_port(settings.http_port if (settings.http_port != socks_p) else (socks_p + 1))
+        self.active_socks_port = socks_p
+        self.active_http_port = http_p
 
-        if (free_socks != settings.socks_port) or (free_http != settings.http_port):
-            self._log(
-                f"[Xray] Port busy; switched local ports to SOCKS={free_socks}, HTTP={free_http}"
-            )
-            settings.socks_port = free_socks
-            settings.http_port = free_http
-            xray_doc, meta = UriConfigCodec.compile_xray_config(
+        if use_native_fragment and direct_remote_host:
+            target_h = direct_remote_host
+            target_p = int(direct_remote_port)
+            dialer_tag = "fragment-out"
+        else:
+            target_h = "127.0.0.1"
+            target_p = int(settings.bridge_port)
+            dialer_tag = ""
+
+        strip_insecure = self._detect_xray_major_version() >= 26
+
+        inbounds = [
+            {
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "port": socks_p,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": True},
+                "sniffing": {"enabled": not is_lab, "destOverride": ["http", "tls", "quic"]},
+            },
+            {
+                "tag": "http-in",
+                "listen": "127.0.0.1",
+                "port": http_p,
+                "protocol": "http",
+                "settings": {"allowTransparent": False},
+                "sniffing": {"enabled": not is_lab, "destOverride": ["http", "tls", "quic"]},
+            },
+        ]
+
+        if enable_native_tun_inbound and (not is_lab):
+            inbounds.append({
+                "tag": "tun-in",
+                "protocol": "tun",
+                "settings": {"name": "AlanTUN", "MTU": int(settings.tun_mtu or 1400), "userLevel": 0},
+                "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
+            })
+
+        def _assemble_config(minimal: bool, force_strip_ins: bool) -> dict:
+            p_out = UriConfigCodec.build_xray_outbound(
                 uri=uri,
                 settings=settings,
-                use_native_fragment=use_native_fragment,
+                target_host=target_h,
+                target_port=target_p,
+                tag="proxy-out",
+                dialer_proxy=dialer_tag,
+                strip_allow_insecure=force_strip_ins,
             )
-            serialized = json.dumps(xray_doc, sort_keys=True, indent=2)
-            digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+            obs = [p_out]
+            if dialer_tag == "fragment-out":
+                frag_out: dict = {
+                    "tag": "fragment-out",
+                    "protocol": "freedom",
+                    "settings": {
+                        "fragment": {
+                            "packets": settings.fragment_packets or "tlshello",
+                            "length": settings.fragment_length or "5-16",
+                            "interval": settings.fragment_interval or "2-3",
+                        }
+                    },
+                    "streamSettings": {"sockopt": {"tcpNoDelay": True}},
+                }
+                if physical_nic_alias:
+                    frag_out["streamSettings"]["sockopt"]["interface"] = physical_nic_alias
+                obs.append(frag_out)
 
-        with self._lock:
-            cfg_path = os.path.join(self.configs_dir, "active.json")
-            with open(cfg_path, "w", encoding="utf-8") as f:
-                f.write(serialized)
+            if minimal:
+                obs.append({"tag": "direct-out", "protocol": "freedom"})
+                return {
+                    "log": {"loglevel": "error"},
+                    "inbounds": inbounds,
+                    "outbounds": obs,
+                }
 
-            bin_name = "xray.exe" if os.name == "nt" else "xray"
-            xray_bin = os.path.join(self.core_dir, bin_name)
-            if not os.path.exists(xray_bin):
-                raise FileNotFoundError(f"Xray binary missing at {xray_bin}")
-
-            self.proc = subprocess.Popen(
-                [xray_bin, "-c", cfg_path],
-                cwd=self.core_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            dns_cfg, extra_obs, routing_cfg = self._build_routing_and_dns(
+                settings=settings,
+                physical_nic_alias=physical_nic_alias,
             )
-            self._active_digest = digest
-            threading.Thread(target=self._pipe_stdout, args=(self.proc,), daemon=True).start()
+            obs.extend(extra_obs)
+            return {
+                "log": {"loglevel": "warning"},
+                "dns": dns_cfg,
+                "inbounds": inbounds,
+                "outbounds": obs,
+                "routing": routing_cfg,
+            }
 
-        time.sleep(0.32)
-        if not self.is_running:
-            self._active_digest = ""
-            raise RuntimeError("Xray process terminated immediately on startup.")
+        prefix = f"lab_{http_p}" if is_lab else "active_runtime"
+        cfg_path = os.path.join(self.configs_dir, f"{prefix}.json")
+        log_path = os.path.join(self.configs_dir, f"{prefix}_xray.log")
+        if is_lab:
+            self._temp_cfg_file = cfg_path
+            self._temp_log_file = log_path
 
-        frag_state = f"{settings.fragment_packets}:{settings.fragment_length}" if use_native_fragment else "BridgeManaged"
-        self._log(
-            f"[Xray] Online ({meta['protocol']} | SNI={meta['sni']} | SOCKS={settings.socks_port} | HTTP={settings.http_port} | Frag={frag_state})"
-        )
-        return meta
+        primary_cfg = _assemble_config(minimal=is_lab, force_strip_ins=strip_insecure)
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump(primary_cfg, fh, indent=2, ensure_ascii=False)
 
-    def _pipe_stdout(self, proc: subprocess.Popen):
+        ok, err_msg = self._spawn_and_wait(exe, cfg_path, log_path, http_p)
+        if ok:
+            return socks_p, http_p
+
+        fallback_cfg = _assemble_config(minimal=True, force_strip_ins=True)
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump(fallback_cfg, fh, indent=2, ensure_ascii=False)
+
+        ok_fb, err_fb = self._spawn_and_wait(exe, cfg_path, log_path, http_p)
+        if ok_fb:
+            self._log(f"[Xray] Started in compatibility mode ({err_msg[:90]})")
+            return socks_p, http_p
+
+        raise RuntimeError(f"Xray exited early: {err_fb or err_msg}")
+
+    @staticmethod
+    def _reserve_unique_ports(count: int) -> List[int]:
+        holders = []
+        ports: List[int] = []
         try:
-            if proc.stdout:
-                for line in iter(proc.stdout.readline, ""):
-                    if not line:
-                        break
-                    clean = line.strip()
-                    if clean:
-                        self._log(f"[XrayCore] {clean}")
-        except Exception:
-            pass
-
-    def stop(self):
-        with self._lock:
-            self._active_digest = ""
-            proc_ref = self.proc
-            self.proc = None
-
-        if proc_ref:
-            try:
-                proc_ref.terminate()
-                proc_ref.wait(timeout=0.8)
-            except Exception:
+            for _ in range(max(1, count)):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("127.0.0.1", 0))
+                holders.append(s)
+                ports.append(int(s.getsockname()[1]))
+        finally:
+            for s in holders:
                 try:
-                    proc_ref.kill()
+                    s.close()
                 except Exception:
                     pass
+        return ports
+
+    def batch_real_ping_and_gemini(
+        self,
+        nodes: List[ProfileNode],
+        settings: EngineSettings,
+        shared_cdn_ip: str = "",
+        check_gemini: bool = False,
+        chunk_size: int = 8,
+        abort_check=None,
+        progress_cb=None,
+        on_chunk_done=None,
+    ) -> Dict[str, Tuple[int, str]]:
+        exe = self.xray_exe_path
+        if (not os.path.exists(exe)) or (not nodes):
+            return {}
+
+        strip_insecure = self._detect_xray_major_version() >= 26
+        results: Dict[str, Tuple[int, str]] = {}
+        total = len(nodes)
+        processed = 0
+
+        cdn_port_ips: Dict[int, str] = {}
+        if settings.auto_clean_ip:
+            cdn_ports = sorted({n.port for n in nodes if CleanIpScanner.is_cdn_eligible(n)})
+            for p_num in cdn_ports[:4]:
+                if (abort_check is not None) and abort_check():
+                    break
+                if shared_cdn_ip and (CleanIpScanner.fast_tcp_ping(shared_cdn_ip, p_num, timeout=1.2) >= 0):
+                    cdn_port_ips[p_num] = shared_cdn_ip
+                else:
+                    found = CleanIpScanner.discover_best_ips(port=p_num, top_n=1, sample_count=24)
+                    if found:
+                        cdn_port_ips[p_num] = found[0][0]
+
+        def _run_subchunk(sub_batch: List[ProfileNode]) -> Dict[str, Tuple[int, str]]:
+            sub_res: Dict[str, Tuple[int, str]] = {}
+
+            def _prep_endpoint(nd: ProfileNode) -> Tuple[ProfileNode, str]:
+                cands: List[str] = []
+                if nd.cached_clean_ip and (not CleanIpScanner.is_poisoned_ip(nd.cached_clean_ip)):
+                    cands.append(nd.cached_clean_ip)
+                if CleanIpScanner.is_cdn_eligible(nd) and (nd.port in cdn_port_ips):
+                    ip_c = cdn_port_ips[nd.port]
+                    if ip_c not in cands:
+                        cands.append(ip_c)
+                orig_ip = CleanIpScanner.resolve_unpoisoned_ipv4(nd.original_host, timeout=1.5)
+                if orig_ip and (orig_ip not in cands):
+                    cands.append(orig_ip)
+                for ip_try in cands:
+                    if CleanIpScanner.fast_tcp_ping(ip_try, nd.port, timeout=1.5) >= 0:
+                        return nd, ip_try
+                return nd, ""
+
+            alive_pairs: List[Tuple[ProfileNode, str]] = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(sub_batch))) as pre_pool:
+                for nd_item, ep_ok in pre_pool.map(_prep_endpoint, sub_batch):
+                    if ep_ok:
+                        alive_pairs.append((nd_item, ep_ok))
+                    else:
+                        sub_res[nd_item.uid] = (-1, "UNKNOWN")
+
+            if not alive_pairs:
+                return sub_res
+
+            reserved = self._reserve_unique_ports(len(alive_pairs) * 2)
+            bridges: List[FullDuplexMutatorBridge] = []
+            inbounds: List[dict] = []
+            outbounds: List[dict] = []
+            rules: List[dict] = []
+            probe_Entries: List[Tuple[ProfileNode, int, FullDuplexMutatorBridge, str, bool]] = []
+            tmp_proc: Optional[subprocess.Popen] = None
+            tmp_cfg_path = ""
+
+            try:
+                for idx, (node, ep_host) in enumerate(alive_pairs):
+                    b_port = reserved[idx * 2]
+                    h_port = reserved[(idx * 2) + 1]
+                    try:
+                        ob = UriConfigCodec.build_xray_outbound(
+                            uri=node.uri,
+                            settings=settings,
+                            target_host="127.0.0.1",
+                            target_port=b_port,
+                            tag=f"out-{idx}",
+                            strip_allow_insecure=strip_insecure,
+                        )
+                    except Exception:
+                        sub_res[node.uid] = (-1, "UNKNOWN")
+                        continue
+
+                    uri_low = node.uri.lower()
+                    is_direct = (
+                        CleanIpScanner.is_domestic_or_direct_tunnel(node)
+                        or ("security=reality" in uri_low)
+                        or ("security=none" in uri_low)
+                    )
+                    init_vec_id = node.cached_vector_id or ("VEC-00" if is_direct else "VEC-21")
+                    br = FullDuplexMutatorBridge(listen_port=b_port)
+                    br.update_route(
+                        remote_host=ep_host,
+                        remote_port=node.port,
+                        vector=find_vector(init_vec_id),
+                        custom_stride=settings.forward_stride_bytes,
+                        jitter_bytes=settings.stride_jitter_bytes,
+                        raw_passthrough=(is_direct or init_vec_id == "VEC-00"),
+                    )
+                    br.start()
+                    bridges.append(br)
+
+                    in_tag = f"in-{idx}"
+                    inbounds.append({
+                        "tag": in_tag,
+                        "listen": "127.0.0.1",
+                        "port": h_port,
+                        "protocol": "http",
+                        "settings": {"allowTransparent": False},
+                    })
+                    outbounds.append(ob)
+                    rules.append({"type": "field", "inboundTag": [in_tag], "outboundTag": f"out-{idx}"})
+                    probe_Entries.append((node, h_port, br, ep_host, is_direct))
+
+                if not probe_Entries:
+                    return sub_res
+
+                fd, tmp_cfg_path = tempfile.mkstemp(prefix="ping_", suffix=".json", dir=self.configs_dir)
+                os.close(fd)
+                with open(tmp_cfg_path, "w", encoding="utf-8") as fh:
+                    json.dump(
+                        {
+                            "log": {"loglevel": "none"},
+                            "inbounds": inbounds,
+                            "outbounds": outbounds,
+                            "routing": {"rules": rules},
+                        },
+                        fh,
+                    )
+
+                flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                tmp_proc = subprocess.Popen(
+                    [exe, "run", "-c", tmp_cfg_path],
+                    cwd=self.core_dir,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    creationflags=flags,
+                )
+
+                first_hp = probe_Entries[0][1]
+                ready = False
+                wait_until = time.perf_counter() + 3.8
+                while time.perf_counter() < wait_until:
+                    if tmp_proc.poll() is not None:
+                        break
+                    s_chk = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s_chk.settimeout(0.12)
+                    try:
+                        s_chk.connect(("127.0.0.1", first_hp))
+                        ready = True
+                        break
+                    except Exception:
+                        time.sleep(0.05)
+                    finally:
+                        s_chk.close()
+
+                if (not ready) and (tmp_proc.poll() is not None) and (len(sub_batch) > 1):
+                    for br in bridges:
+                        br.stop()
+                    bridges.clear()
+                    for single_nd, _ in alive_pairs:
+                        sub_res.update(_run_subchunk([single_nd]))
+                    return sub_res
+
+                if not ready:
+                    for nd_item, _, _, _, _ in probe_Entries:
+                        sub_res[nd_item.uid] = (-1, "UNKNOWN")
+                    return sub_res
+
+                def _probe_entry(entry: Tuple[ProfileNode, int, FullDuplexMutatorBridge, str, bool]) -> Tuple[str, int, str]:
+                    nd, hp, br, ep_h, is_dir = entry
+                    used_vec = br.active_vector.vector_id
+                    ok, rtt, _ = TunnelStreamVerifier.fast_probe(hp, timeout=4.0)
+                    if (not ok) and (not is_dir):
+                        for fb_vid in ("VEC-01", "VEC-20"):
+                            if fb_vid == used_vec:
+                                continue
+                            br.update_route(
+                                remote_host=ep_h,
+                                remote_port=nd.port,
+                                vector=find_vector(fb_vid),
+                                custom_stride=settings.forward_stride_bytes,
+                                jitter_bytes=settings.stride_jitter_bytes,
+                                raw_passthrough=False,
+                                flush_existing_pool=True,
+                            )
+                            ok, rtt, _ = TunnelStreamVerifier.fast_probe(hp, timeout=3.6)
+                            if ok:
+                                used_vec = fb_vid
+                                break
+
+                    if not ok:
+                        return nd.uid, -1, "UNKNOWN"
+
+                    nd.cached_vector_id = used_vec
+                    if CleanIpScanner.is_cdn_eligible(nd) and (ep_h != nd.original_host):
+                        nd.cached_clean_ip = ep_h
+
+                    gem_stat = nd.gemini_status if (nd.gemini_status == "OK") else "UNKNOWN"
+                    if check_gemini:
+                        g_ok, _ = TunnelStreamVerifier.check_gemini_access(hp, timeout=5.2)
+                        gem_stat = "OK" if g_ok else "BLOCKED"
+                    return nd.uid, rtt, gem_stat
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(probe_Entries)) as ex_pool:
+                    for uid_v, rtt_v, gem_v in ex_pool.map(_probe_entry, probe_Entries):
+                        sub_res[uid_v] = (rtt_v, gem_v)
+
+                return sub_res
+            finally:
+                if tmp_proc is not None:
+                    try:
+                        tmp_proc.terminate()
+                        tmp_proc.wait(timeout=1.2)
+                    except Exception:
+                        try:
+                            tmp_proc.kill()
+                        except Exception:
+                            pass
+                for br in bridges:
+                    br.stop()
+                if tmp_cfg_path and os.path.exists(tmp_cfg_path):
+                    try:
+                        os.remove(tmp_cfg_path)
+                    except Exception:
+                        pass
+
+        step_sz = max(1, int(chunk_size))
+        for start in range(0, total, step_sz):
+            if (abort_check is not None) and abort_check():
+                break
+            batch = nodes[start : start + step_sz]
+            chunk_out = _run_subchunk(batch)
+            results.update(chunk_out)
+            if on_chunk_done is not None:
+                try:
+                    on_chunk_done(chunk_out)
+                except Exception:
+                    pass
+            processed += len(batch)
+            if progress_cb is not None:
+                pct = min(99, int((processed / max(1, total)) * 100))
+                progress_cb(pct, f"پینگ واقعی تونل ({processed}/{total})...")
+
+        return results
+
+    def stop(self):
+        if self.proc is not None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
+
+        for fpath in (self._temp_cfg_file, self._temp_log_file):
+            if fpath and os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except Exception:
+                    pass
+        self._temp_cfg_file = ""
+        self._temp_log_file = ""

@@ -1,11 +1,14 @@
-__pycache__/
+﻿__pycache__/
 *.py[cod]
+*.pyd
+*.spec
 build/
 dist/
 release/
-*.spec
 logs/
 configs/*.json
+configs/*.dat
+configs/.auto_pool_url
 core/*.exe
 core/*.dll
 core/*.dat

@@ -5,7 +5,7 @@ from typing import List
 
 
 APP_NAME = "Alan-RIP-Dpi"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 
 class EngineState(str, Enum):
@@ -40,24 +40,39 @@ def format_uptime_hms(total_seconds: int) -> str:
 
 @dataclass
 class EngineSettings:
+    language: str = "fa"
+    theme_mode: str = "dark"
+    minimize_to_tray: bool = True
+
     autopilot_enabled: bool = True
+    auto_pool_enabled: bool = True
     auto_clean_ip: bool = True
     require_youtube_6s: bool = True
     verify_upload_stream: bool = True
     self_healing_watchdog: bool = True
+
     system_proxy_enabled: bool = True
     tun_enabled: bool = False
-    tun_auto_download: bool = True
+    tun_auto_download: bool = False
     tun_mtu: int = 1400
     tun_dns: str = "1.1.1.1"
-    theme_mode: str = "dark"
 
-    selected_profile_uid: str = ""
+    sub_auto_update_hours: int = 6
+
+    routing_mode: str = "bypass_ir"
+    block_quic: bool = True
+    remote_dns: str = "1.1.1.1"
+    domestic_dns: str = "178.22.122.100"
+    custom_direct_domains: str = ""
+    custom_proxy_domains: str = ""
+    custom_blocked_domains: str = ""
+
+    selected_profile_uid: str = "__SMART_AUTO__"
     selected_index: int = 0
 
     engine_mode: str = "auto_hybrid"
     manual_vector_id: str = "VEC-01"
-    fingerprint: str = "chrome"
+    fingerprint: str = "custom_poly"
     alpn_override: str = "auto"
     ws_early_data: int = 0
 
@@ -81,10 +96,7 @@ class EngineSettings:
     @classmethod
     def from_dict(cls, data: dict) -> "EngineSettings":
         valid_keys = {f.name for f in cls.__dataclass_fields__.values()}
-        filtered = {}
-        for k, v in data.items():
-            if k in valid_keys:
-                filtered[k] = v
+        filtered = {k: v for k, v in data.items() if k in valid_keys}
         return cls(**filtered)
 
 
@@ -106,6 +118,11 @@ class BypassVector:
     frag_delay_min_ms: int = 0
     frag_delay_max_ms: int = 0
     frag_flights: int = 1
+    record_envelope: str = "none"
+    uplink_oob_shield: bool = False
+    uplink_mss_clamp: int = 0
+    tail_anchor_bytes: int = 0
+    hybrid_mode: str = "none"
 
 
 @dataclass
@@ -122,7 +139,10 @@ class ProfileNode:
     cached_vector_id: str = ""
     last_ping_ms: int = -1
     health_status: str = "UNTESTED"
+    gemini_status: str = "UNKNOWN"
+    upload_kbps: float = 0.0
     last_tested_ts: int = 0
+    is_hidden_pool: bool = False
 
     def to_dict(self) -> dict:
         payload = asdict(self)
@@ -130,6 +150,7 @@ class ProfileNode:
         payload["host"] = effective_host
         payload["address"] = effective_host
         payload["endpoint"] = f"{effective_host}:{self.port}"
+        payload["gemini_ok"] = self.gemini_status == "OK"
         return payload
 
     @classmethod
@@ -140,6 +161,37 @@ class ProfileNode:
             normalized["original_host"] = str(fallback_host)
         valid_keys = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in normalized.items() if k in valid_keys}
+        return cls(**filtered)
+
+
+@dataclass
+class VerifiedOutputItem:
+    uid: str
+    profile_uid: str
+    name: str
+    protocol: str
+    uri: str
+    endpoint_host: str
+    port: int
+    sni: str
+    vector_id: str
+    vector_name: str
+    ping_ms: int = -1
+    upload_kbps: float = 0.0
+    gemini_status: str = "UNKNOWN"
+    group_tag: str = "Lab"
+    verified_ts: int = 0
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["endpoint"] = f"{self.endpoint_host}:{self.port}"
+        d["gemini_ok"] = self.gemini_status == "OK"
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "VerifiedOutputItem":
+        valid_keys = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in data.items() if k in valid_keys}
         return cls(**filtered)
 
 
@@ -174,11 +226,22 @@ class TelemetrySnapshot:
     uptime_label: str = "00:00:00"
     tun_enabled: bool = False
     tun_active: bool = False
+    system_proxy_enabled: bool = True
+    gemini_ready: bool = False
+    gemini_status: str = "UNKNOWN"
     selected_index: int = 0
     active_profile_uid: str = ""
     active_profile_name: str = "---"
     protocol_label: str = "---"
     egress_ip: str = "---"
+    egress_country_code: str = ""
+    country_code: str = ""
+    egress_country: str = "مسیر جهانی"
+    egress_country_en: str = "Global"
+    egress_country_fa: str = "مسیر جهانی"
+    destination_label: str = "مسیر جهانی"
+    tun_badge: str = "OFF"
+    auto_mode_enabled: bool = True
     endpoint_ip: str = "---"
     active_vector_id: str = "AUTO"
     active_vector_name: str = "Auto-Adaptive Core"
@@ -191,6 +254,34 @@ class TelemetrySnapshot:
     rx_total_bytes: int = 0
     active_sessions: int = 0
     progress_percent: int = 0
+
+
+AUTOPILOT_PRIORITY_IDS: List[str] = [
+    "VEC-21",
+    "VEC-22",
+    "VEC-01",
+    "VEC-18",
+    "VEC-17",
+    "VEC-19",
+    "VEC-20",
+    "VEC-23",
+    "VEC-04",
+    "VEC-02",
+    "VEC-03",
+    "VEC-05",
+    "VEC-06",
+    "VEC-07",
+    "VEC-08",
+    "VEC-09",
+    "VEC-10",
+    "VEC-15",
+    "VEC-16",
+    "VEC-11",
+    "VEC-13",
+    "VEC-14",
+    "VEC-12",
+    "VEC-00",
+]
 
 
 VECTOR_REGISTRY: List[BypassVector] = [
@@ -388,6 +479,78 @@ VECTOR_REGISTRY: List[BypassVector] = [
         coalesce_flight2=True,
     ),
     BypassVector(
+        vector_id="VEC-17",
+        code_name="Aligned Record Relay",
+        family="COALESCE",
+        summary="Multi-frame record boundary alignment over single buffer flush",
+        outer_version=0x0303,
+        record_envelope="sni_dot_3rec",
+        uplink_mss_clamp=1380,
+        coalesce_flight2=False,
+    ),
+    BypassVector(
+        vector_id="VEC-18",
+        code_name="Adaptive Core Delta",
+        family="PROPRIETARY",
+        summary="Early header pointer alignment with trailing segment split",
+        outer_version=0x0304,
+        urgent_mode="cipher_pivot",
+        tail_anchor_bytes=36,
+        uplink_mss_clamp=1360,
+        coalesce_flight2=False,
+    ),
+    BypassVector(
+        vector_id="VEC-19",
+        code_name="Stream Window Balance",
+        family="PROPRIETARY",
+        summary="Dual-frame handshake alignment with outbound stream pacing",
+        outer_version=0x0303,
+        record_envelope="sni_mid_2rec",
+        uplink_oob_shield=True,
+        uplink_mss_clamp=1360,
+        coalesce_flight2=False,
+    ),
+    BypassVector(
+        vector_id="VEC-20",
+        code_name="Progressive Frame Sync",
+        family="COALESCE",
+        summary="Stepped multi-record frame segmentation with tail pacing",
+        outer_version=0x0303,
+        record_envelope="fibonacci_7rec",
+        uplink_mss_clamp=1380,
+        coalesce_flight2=False,
+    ),
+    BypassVector(
+        vector_id="VEC-21",
+        code_name="Adaptive Core Omega",
+        family="PROPRIETARY",
+        summary="Composite header boundary shift with forward window cut",
+        outer_version=0x0303,
+        hybrid_mode="phantom_seam_oob",
+        uplink_mss_clamp=1380,
+        coalesce_flight2=False,
+    ),
+    BypassVector(
+        vector_id="VEC-22",
+        code_name="Dual-Window Stream Core",
+        family="PROPRIETARY",
+        summary="Segmented header cell alignment with secondary window cut",
+        outer_version=0x0304,
+        hybrid_mode="sni_microcell_pincer",
+        uplink_mss_clamp=1360,
+        coalesce_flight2=False,
+    ),
+    BypassVector(
+        vector_id="VEC-23",
+        code_name="Interleaved Record Sync",
+        family="COALESCE",
+        summary="Alternating record header framing with forward segment split",
+        outer_version=0x0301,
+        hybrid_mode="chameleon_interleave",
+        uplink_mss_clamp=1380,
+        coalesce_flight2=False,
+    ),
+    BypassVector(
         vector_id="VEC-00",
         code_name="Direct Tunnel Passthrough",
         family="DIRECT",
@@ -409,8 +572,13 @@ def find_vector(vector_id: str) -> BypassVector:
 
 
 def filter_vectors_by_mode(engine_mode: str) -> List[BypassVector]:
+    rank_map = {vid: idx for idx, vid in enumerate(AUTOPILOT_PRIORITY_IDS)}
     if engine_mode == "fragment_only":
-        return [v for v in VECTOR_REGISTRY if v.family in ("FRAGMENT", "COALESCE", "DIRECT")]
-    if engine_mode == "proprietary_only":
-        return [v for v in VECTOR_REGISTRY if v.family in ("PROPRIETARY", "COALESCE", "DIRECT")]
-    return list(VECTOR_REGISTRY)
+        pool = [v for v in VECTOR_REGISTRY if v.family in ("FRAGMENT", "COALESCE", "DIRECT")]
+    elif engine_mode == "proprietary_only":
+        pool = [v for v in VECTOR_REGISTRY if v.family in ("PROPRIETARY", "COALESCE", "DIRECT")]
+    else:
+        pool = list(VECTOR_REGISTRY)
+    pool.sort(key=lambda v: rank_map.get(v.vector_id, 999))
+    return pool
+

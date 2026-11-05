@@ -1,10 +1,11 @@
 import math
-import random
+import re
 from collections import deque
-from pathlib import Path
 from PySide6.QtCore import (
     Property,
     QEasingCurve,
+    QEvent,
+    QObject,
     QPointF,
     QPropertyAnimation,
     QRectF,
@@ -22,7 +23,6 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QPen,
-    QPixmap,
     QRadialGradient,
 )
 from PySide6.QtWidgets import (
@@ -33,1573 +33,278 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
-    QVBoxLayout,
     QWidget,
 )
 
 from .flag_icons import GeoFlagResolver, VectorFlagRenderer
 from .theme import (
     DARK_PALETTE,
+    I18N,
     ThemePalette,
     enforce_english_ltr,
     lock_widget_dimensions,
     make_mono_font,
     make_ui_font,
-    sanitize_ui_text,
+    strip_emojis,
+)
+from .vector_icons import VectorIconPainter
+
+_RGBA_RE = re.compile(
+    r"rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([0-9.]+))?\s*\)",
+    re.IGNORECASE,
 )
 
 
+def parse_css_color(value: str, fallback: str = "#181F2C") -> QColor:
+    raw = str(value or "").strip()
+    if not raw:
+        return QColor(fallback)
+    m = _RGBA_RE.match(raw)
+    if m:
+        r = max(0, min(255, int(m.group(1))))
+        g = max(0, min(255, int(m.group(2))))
+        b = max(0, min(255, int(m.group(3))))
+        a_str = m.group(4)
+        if a_str is None:
+            a = 255
+        else:
+            af = float(a_str)
+            a = int(round(af * 255.0)) if af <= 1.0 else int(round(af))
+        return QColor(r, g, b, max(0, min(255, a)))
+    col = QColor(raw)
+    return col if col.isValid() else QColor(fallback)
+
+
 def _lerp_color(a: QColor, b: QColor, t: float) -> QColor:
+    k = max(0.0, min(1.0, float(t)))
     return QColor(
-        int(a.red() + (b.red() - a.red()) * t),
-        int(a.green() + (b.green() - a.green()) * t),
-        int(a.blue() + (b.blue() - a.blue()) * t),
-        int(a.alpha() + (b.alpha() - a.alpha()) * t),
+        int(a.red() + (b.red() - a.red()) * k),
+        int(a.green() + (b.green() - a.green()) * k),
+        int(a.blue() + (b.blue() - a.blue()) * k),
+        int(a.alpha() + (b.alpha() - a.alpha()) * k),
     )
 
 
-class VectorIconPainter:
-    @staticmethod
-    def draw_brand_logo(painter: QPainter, rect: QRectF, logo_path: str = "assets/logo.png"):
-        painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+def draw_neu_raised(
+    painter: QPainter,
+    rect: QRectF,
+    radius: float,
+    palette: ThemePalette,
+    depth: float = 5.5,
+    hovered: bool = False,
+    accent_tint: QColor | None = None,
+) -> None:
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(Qt.PenStyle.NoPen)
 
-        path_obj = Path(logo_path)
-        if path_obj.is_file():
-            pix = QPixmap(str(path_obj))
-            if not pix.isNull():
-                scaled = pix.scaled(
-                    int(rect.width()),
-                    int(rect.height()),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-                x = rect.x() + (rect.width() - scaled.width()) / 2
-                y = rect.y() + (rect.height() - scaled.height()) / 2
-                painter.drawPixmap(int(x), int(y), scaled)
-                painter.restore()
-                return
+    dark_base = parse_css_color(palette.neu_shadow_dark)
+    light_base = parse_css_color(palette.neu_shadow_light)
 
-        cx, cy = rect.center().x(), rect.center().y()
-        w, h = rect.width() * 0.84, rect.height() * 0.84
-        left, top = cx - w / 2, cy - h / 2
+    layers = 4
+    for step in range(layers, 0, -1):
+        ratio = step / layers
+        shift = depth * ratio
+        spread = shift * 0.40
 
-        shield = QPainterPath()
-        shield.moveTo(cx, top)
-        shield.lineTo(left + w, top + h * 0.20)
-        shield.cubicTo(left + w, top + h * 0.62, cx + w * 0.35, top + h * 0.86, cx, top + h)
-        shield.cubicTo(cx - w * 0.35, top + h * 0.86, left, top + h * 0.62, left, top + h * 0.20)
-        shield.closeSubpath()
+        d_col = QColor(dark_base)
+        d_col.setAlpha(max(4, int(palette.neu_dark_alpha * (1.0 - ratio * 0.70) * 0.46)))
+        painter.setBrush(d_col)
+        painter.drawRoundedRect(
+            rect.adjusted(shift - spread, shift - spread, shift + spread, shift + spread),
+            radius + spread,
+            radius + spread,
+        )
 
-        grad = QLinearGradient(left, top, left + w, top + h)
-        grad.setColorAt(0.0, QColor("#FFE14D"))
-        grad.setColorAt(1.0, QColor("#F59E0B"))
+        l_col = QColor(light_base)
+        l_col.setAlpha(max(4, int(palette.neu_light_alpha * (1.0 - ratio * 0.68) * 0.48)))
+        painter.setBrush(l_col)
+        painter.drawRoundedRect(
+            rect.adjusted(-shift - spread, -shift - spread, -shift + spread, -shift + spread),
+            radius + spread,
+            radius + spread,
+        )
 
-        painter.setBrush(QColor(255, 208, 0, 38))
-        painter.setPen(QPen(grad, 2.0))
-        painter.drawPath(shield)
+    surf = QLinearGradient(rect.topLeft(), rect.bottomRight())
+    hi_c = parse_css_color(palette.card_hover_bg if hovered else palette.surface_hi)
+    mid_c = parse_css_color(palette.card_bg)
+    lo_c = parse_css_color(palette.surface_lo)
+    if accent_tint is not None:
+        hi_c = _lerp_color(hi_c, accent_tint, 0.11 if palette.is_dark else 0.07)
+        mid_c = _lerp_color(mid_c, accent_tint, 0.05 if palette.is_dark else 0.03)
 
-        bolt = QPainterPath()
-        bolt.moveTo(cx + w * 0.10, top + h * 0.18)
-        bolt.lineTo(cx - w * 0.20, cy + h * 0.04)
-        bolt.lineTo(cx + w * 0.02, cy + h * 0.04)
-        bolt.lineTo(cx - w * 0.12, top + h * 0.82)
-        bolt.lineTo(cx + w * 0.22, cy - h * 0.05)
-        bolt.lineTo(cx + w * 0.01, cy - h * 0.05)
-        bolt.closeSubpath()
+    surf.setColorAt(0.0, hi_c)
+    surf.setColorAt(0.52, mid_c)
+    surf.setColorAt(1.0, lo_c)
 
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#FFFFFF"))
-        painter.drawPath(bolt)
-        painter.restore()
+    bevel = QLinearGradient(rect.topLeft(), rect.bottomRight())
+    bv_l = parse_css_color(palette.neu_bevel_light)
+    bv_d = parse_css_color(palette.neu_bevel_dark)
+    if accent_tint is not None:
+        bv_l = _lerp_color(bv_l, accent_tint, 0.45 if hovered else 0.24)
+    bevel.setColorAt(0.0, bv_l)
+    bevel.setColorAt(0.55, QColor(bv_l.red(), bv_l.green(), bv_l.blue(), 16))
+    bevel.setColorAt(1.0, bv_d)
 
-    @staticmethod
-    def draw_icon(
-        painter: QPainter,
-        name: str,
-        rect: QRectF,
-        color: QColor,
-        stroke: float = 1.8,
-        angle: float = 0.0,
+    painter.setBrush(surf)
+    painter.setPen(QPen(bevel, 1.15))
+    painter.drawRoundedRect(rect, radius, radius)
+    painter.restore()
+
+
+def draw_neu_inset(
+    painter: QPainter,
+    rect: QRectF,
+    radius: float,
+    palette: ThemePalette,
+    depth: float = 4.2,
+    glow_tint: QColor | None = None,
+) -> None:
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+    well_grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
+    c_top = parse_css_color(palette.input_bg)
+    c_bot = parse_css_color(palette.subtle_bg)
+    if glow_tint is not None:
+        c_top = _lerp_color(c_top, glow_tint, 0.20 if palette.is_dark else 0.14)
+        c_bot = _lerp_color(c_bot, glow_tint, 0.12 if palette.is_dark else 0.08)
+    well_grad.setColorAt(0.0, c_top)
+    well_grad.setColorAt(1.0, c_bot)
+
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(well_grad)
+    painter.drawRoundedRect(rect, radius, radius)
+
+    clip = QPainterPath()
+    clip.addRoundedRect(rect, radius, radius)
+    painter.setClipPath(clip)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    dark_col = parse_css_color(palette.neu_shadow_dark)
+    light_col = parse_css_color(palette.neu_shadow_light)
+
+    for i in range(3):
+        w_pen = (3 - i) * (depth * 0.50)
+        off = (i + 1) * 1.0
+
+        dc = QColor(dark_col)
+        dc.setAlpha(int(palette.neu_dark_alpha * (0.46 - i * 0.11)))
+        painter.setPen(QPen(dc, w_pen))
+        painter.drawRoundedRect(
+            rect.adjusted(-1.0 + off, -1.0 + off, 6.0 + off, 6.0 + off),
+            radius,
+            radius,
+        )
+
+        lc = QColor(light_col)
+        lc.setAlpha(int(palette.neu_light_alpha * (0.46 - i * 0.11)))
+        painter.setPen(QPen(lc, w_pen))
+        painter.drawRoundedRect(
+            rect.adjusted(-6.0 - off, -6.0 - off, 1.0 - off, 1.0 - off),
+            radius,
+            radius,
+        )
+
+    painter.setClipping(False)
+    rim = QLinearGradient(rect.topLeft(), rect.bottomRight())
+    rim.setColorAt(0.0, parse_css_color(palette.neu_bevel_dark))
+    rim.setColorAt(1.0, parse_css_color(palette.neu_bevel_light))
+    painter.setPen(QPen(rim, 1.05))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawRoundedRect(rect, radius, radius)
+    painter.restore()
+
+
+_VIBRANT_FLAG_TRIADS: dict[str, tuple[str, str, str]] = {
+    "IR": ("#10B981", "#FFD000", "#EF4444"),
+    "DE": ("#FFD000", "#EF4444", "#F59E0B"),
+    "NL": ("#3B82F6", "#94A3B8", "#F43F5E"),
+    "US": ("#3B82F6", "#EF4444", "#38BDF8"),
+    "GB": ("#2563EB", "#EF4444", "#38BDF8"),
+    "FR": ("#3B82F6", "#60A5FA", "#EF4444"),
+    "FI": ("#38BDF8", "#0284C7", "#60A5FA"),
+    "SE": ("#0EA5E9", "#FACC15", "#38BDF8"),
+    "CH": ("#EF4444", "#FB7185", "#DC2626"),
+    "TR": ("#EF4444", "#F87171", "#DC2626"),
+    "AE": ("#10B981", "#EF4444", "#34D399"),
+    "SG": ("#EF4444", "#FB7185", "#F43F5E"),
+    "JP": ("#F43F5E", "#FB7185", "#E11D48"),
+    "CA": ("#EF4444", "#F87171", "#DC2626"),
+    "PL": ("#E11D48", "#FB7185", "#F43F5E"),
+    "AT": ("#EF4444", "#F87171", "#DC2626"),
+    "IT": ("#10B981", "#34D399", "#EF4444"),
+    "ES": ("#FACC15", "#EF4444", "#F59E0B"),
+    "RU": ("#3B82F6", "#EF4444", "#60A5FA"),
+    "UA": ("#0EA5E9", "#FFD000", "#38BDF8"),
+    "RO": ("#3B82F6", "#FACC15", "#EF4444"),
+    "KR": ("#3B82F6", "#EF4444", "#60A5FA"),
+    "IN": ("#FB923C", "#10B981", "#F59E0B"),
+    "GLOBAL": ("#FFD000", "#38BDF8", "#10B981"),
+}
+
+
+def get_flag_neon_triad(code: str) -> tuple[QColor, QColor, QColor]:
+    norm = str(code or "GLOBAL").strip().upper()
+    if norm == "UK":
+        norm = "GB"
+    if norm in _VIBRANT_FLAG_TRIADS:
+        h1, h2, h3 = _VIBRANT_FLAG_TRIADS[norm]
+        return QColor(h1), QColor(h2), QColor(h3)
+    spec = GeoFlagResolver.get_spec(norm)
+    return QColor(spec.c1), QColor(spec.c2), QColor(spec.c3)
+
+
+class NeuCard(QFrame):
+    def __init__(
+        self,
+        mode: str = "raised",
+        radius: float = 18.0,
+        depth: float = 5.2,
+        pad: float = 6.5,
+        parent=None,
     ):
-        painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        pen = QPen(color, stroke, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-
-        cx, cy = rect.center().x(), rect.center().y()
-        r = min(rect.width(), rect.height()) * 0.40
-
-        if name == "radar_home":
-            painter.drawEllipse(QPointF(cx, cy), r, r)
-            painter.drawEllipse(QPointF(cx, cy), r * 0.52, r * 0.52)
-            painter.setBrush(color)
-            painter.drawEllipse(QPointF(cx, cy), 1.8, 1.8)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawLine(QPointF(cx, cy), QPointF(cx + r * 0.72, cy - r * 0.68))
-
-        elif name == "scanner":
-            painter.drawEllipse(QPointF(cx, cy), r * 0.82, r * 0.82)
-            painter.drawLine(QPointF(cx - r * 1.08, cy), QPointF(cx - r * 0.45, cy))
-            painter.drawLine(QPointF(cx + r * 0.45, cy), QPointF(cx + r * 1.08, cy))
-            painter.drawLine(QPointF(cx, cy - r * 1.08), QPointF(cx, cy - r * 0.45))
-            painter.drawLine(QPointF(cx, cy + r * 0.45), QPointF(cx, cy + r * 1.08))
-            painter.setBrush(color)
-            painter.drawEllipse(QPointF(cx, cy), 2.0, 2.0)
-
-        elif name == "hunter":
-            painter.drawEllipse(QPointF(cx, cy), r * 0.90, r * 0.90)
-            painter.drawLine(QPointF(cx - r * 1.15, cy), QPointF(cx - r * 0.62, cy))
-            painter.drawLine(QPointF(cx + r * 0.62, cy), QPointF(cx + r * 1.15, cy))
-            painter.drawLine(QPointF(cx, cy - r * 1.15), QPointF(cx, cy - r * 0.62))
-            painter.drawLine(QPointF(cx, cy + r * 0.62), QPointF(cx, cy + r * 1.15))
-            bolt = QPainterPath()
-            bolt.moveTo(cx + r * 0.16, cy - r * 0.56)
-            bolt.lineTo(cx - r * 0.30, cy + r * 0.05)
-            bolt.lineTo(cx + r * 0.04, cy + r * 0.05)
-            bolt.lineTo(cx - r * 0.16, cy + r * 0.58)
-            bolt.lineTo(cx + r * 0.32, cy - r * 0.06)
-            bolt.lineTo(cx - r * 0.02, cy - r * 0.06)
-            bolt.closeSubpath()
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(color)
-            painter.drawPath(bolt)
-
-        elif name == "power":
-            arc_r = r * 0.86
-            arc_rect = QRectF(cx - arc_r, cy - arc_r + r * 0.08, arc_r * 2, arc_r * 2)
-            painter.drawArc(arc_rect, 130 * 16, 280 * 16)
-            painter.drawLine(QPointF(cx, cy - r * 0.95), QPointF(cx, cy - r * 0.05))
-
-        elif name == "shield_check":
-            w, h = r * 1.85, r * 2.05
-            left, top = cx - w / 2, cy - h / 2
-            sh = QPainterPath()
-            sh.moveTo(cx, top)
-            sh.lineTo(left + w, top + h * 0.22)
-            sh.cubicTo(left + w, top + h * 0.64, cx + w * 0.36, top + h * 0.88, cx, top + h)
-            sh.cubicTo(cx - w * 0.36, top + h * 0.88, left, top + h * 0.64, left, top + h * 0.22)
-            sh.closeSubpath()
-            painter.drawPath(sh)
-            painter.drawLine(QPointF(cx - r * 0.36, cy + r * 0.04), QPointF(cx - r * 0.06, cy + r * 0.34))
-            painter.drawLine(QPointF(cx - r * 0.06, cy + r * 0.34), QPointF(cx + r * 0.42, cy - r * 0.22))
-
-        elif name == "spinner":
-            painter.translate(cx, cy)
-            painter.rotate(angle)
-            sp_r = r * 0.88
-            arc_rect = QRectF(-sp_r, -sp_r, sp_r * 2, sp_r * 2)
-            faint = QColor(color)
-            faint.setAlpha(55)
-            painter.setPen(QPen(faint, stroke))
-            painter.drawEllipse(QPointF(0, 0), sp_r, sp_r)
-            painter.setPen(QPen(color, stroke + 0.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.drawArc(arc_rect, 0, 105 * 16)
-
-        elif name == "clock":
-            painter.drawEllipse(QPointF(cx, cy + r * 0.06), r * 0.88, r * 0.88)
-            painter.drawLine(QPointF(cx - r * 0.28, cy - r * 1.02), QPointF(cx + r * 0.28, cy - r * 1.02))
-            painter.drawLine(QPointF(cx, cy + r * 0.06), QPointF(cx, cy - r * 0.42))
-            painter.drawLine(QPointF(cx, cy + r * 0.06), QPointF(cx + r * 0.38, cy + r * 0.24))
-
-        elif name == "tun_shield":
-            w, h = r * 1.85, r * 2.05
-            left, top = cx - w / 2, cy - h / 2
-            sh = QPainterPath()
-            sh.moveTo(cx, top)
-            sh.lineTo(left + w, top + h * 0.22)
-            sh.cubicTo(left + w, top + h * 0.64, cx + w * 0.36, top + h * 0.88, cx, top + h)
-            sh.cubicTo(cx - w * 0.36, top + h * 0.88, left, top + h * 0.64, left, top + h * 0.22)
-            sh.closeSubpath()
-            painter.drawPath(sh)
-            painter.drawLine(QPointF(cx - r * 0.42, cy + r * 0.05), QPointF(cx + r * 0.42, cy + r * 0.05))
-            painter.drawEllipse(QPointF(cx, cy + r * 0.05), r * 0.24, r * 0.24)
-
-        elif name == "profiles":
-            p1 = QPainterPath()
-            p1.moveTo(cx, cy - r * 0.9)
-            p1.lineTo(cx + r, cy - r * 0.35)
-            p1.lineTo(cx, cy + r * 0.2)
-            p1.lineTo(cx - r, cy - r * 0.35)
-            p1.closeSubpath()
-            painter.drawPath(p1)
-
-            p2 = QPainterPath()
-            p2.moveTo(cx - r, cy + r * 0.15)
-            p2.lineTo(cx, cy + r * 0.7)
-            p2.lineTo(cx + r, cy + r * 0.15)
-            painter.drawPath(p2)
-
-            p3 = QPainterPath()
-            p3.moveTo(cx - r, cy + r * 0.55)
-            p3.lineTo(cx, cy + r * 1.05)
-            p3.lineTo(cx + r, cy + r * 0.55)
-            painter.drawPath(p3)
-
-        elif name == "settings":
-            painter.drawEllipse(QPointF(cx, cy), r * 0.40, r * 0.40)
-            for i in range(8):
-                ang = i * (math.pi / 4.0)
-                p_in = QPointF(cx + math.cos(ang) * r * 0.68, cy + math.sin(ang) * r * 0.68)
-                p_out = QPointF(cx + math.cos(ang) * r * 0.98, cy + math.sin(ang) * r * 0.98)
-                painter.drawLine(p_in, p_out)
-            painter.drawEllipse(QPointF(cx, cy), r * 0.70, r * 0.70)
-
-        elif name == "logs":
-            box = QRectF(cx - r, cy - r * 0.82, r * 2.0, r * 1.64)
-            painter.drawRoundedRect(box, 3.5, 3.5)
-            painter.drawLine(QPointF(cx - r * 0.55, cy - r * 0.25), QPointF(cx - r * 0.15, cy + r * 0.08))
-            painter.drawLine(QPointF(cx - r * 0.15, cy + r * 0.08), QPointF(cx - r * 0.55, cy + r * 0.40))
-            painter.drawLine(QPointF(cx + r * 0.05, cy + r * 0.40), QPointF(cx + r * 0.55, cy + r * 0.40))
-
-        elif name in ("lock", "lock_closed"):
-            body = QRectF(cx - r * 0.68, cy - r * 0.05, r * 1.36, r * 1.05)
-            painter.drawRoundedRect(body, 3.8, 3.8)
-            shackle = QPainterPath()
-            shackle.moveTo(cx - r * 0.42, cy - r * 0.05)
-            shackle.lineTo(cx - r * 0.42, cy - r * 0.48)
-            shackle.arcTo(QRectF(cx - r * 0.42, cy - r * 0.92, r * 0.84, r * 0.84), 180, -180)
-            shackle.lineTo(cx + r * 0.42, cy - r * 0.05)
-            painter.drawPath(shackle)
-            painter.setBrush(color)
-            painter.drawEllipse(QPointF(cx, cy + r * 0.44), 2.0, 2.0)
-
-        elif name == "lock_open":
-            body = QRectF(cx - r * 0.68, cy + r * 0.02, r * 1.36, r * 1.02)
-            painter.drawRoundedRect(body, 3.8, 3.8)
-            shackle = QPainterPath()
-            shackle.moveTo(cx - r * 0.42, cy + r * 0.02)
-            shackle.lineTo(cx - r * 0.42, cy - r * 0.52)
-            shackle.arcTo(QRectF(cx - r * 0.42, cy - r * 0.96, r * 0.84, r * 0.84), 180, -155)
-            painter.drawPath(shackle)
-            painter.setBrush(color)
-            painter.drawEllipse(QPointF(cx, cy + r * 0.50), 2.0, 2.0)
-
-        elif name == "ip_globe":
-            painter.drawEllipse(QPointF(cx, cy), r, r)
-            painter.drawEllipse(QPointF(cx, cy), r * 0.48, r)
-            painter.drawLine(QPointF(cx - r, cy), QPointF(cx + r, cy))
-
-        elif name == "download":
-            painter.drawLine(QPointF(cx, cy - r * 0.85), QPointF(cx, cy + r * 0.55))
-            painter.drawLine(QPointF(cx - r * 0.5, cy + r * 0.08), QPointF(cx, cy + r * 0.6))
-            painter.drawLine(QPointF(cx + r * 0.5, cy + r * 0.08), QPointF(cx, cy + r * 0.6))
-            painter.drawLine(QPointF(cx - r * 0.7, cy + r * 0.9), QPointF(cx + r * 0.7, cy + r * 0.9))
-
-        elif name == "upload":
-            painter.drawLine(QPointF(cx, cy + r * 0.65), QPointF(cx, cy - r * 0.75))
-            painter.drawLine(QPointF(cx - r * 0.5, cy - r * 0.25), QPointF(cx, cy - r * 0.78))
-            painter.drawLine(QPointF(cx + r * 0.5, cy - r * 0.25), QPointF(cx, cy - r * 0.78))
-            painter.drawLine(QPointF(cx - r * 0.7, cy + r * 0.9), QPointF(cx + r * 0.7, cy + r * 0.9))
-
-        elif name == "wave":
-            path = QPainterPath()
-            path.moveTo(cx - r, cy)
-            path.lineTo(cx - r * 0.45, cy)
-            path.lineTo(cx - r * 0.20, cy - r * 0.75)
-            path.lineTo(cx + r * 0.20, cy + r * 0.75)
-            path.lineTo(cx + r * 0.45, cy)
-            path.lineTo(cx + r, cy)
-            painter.drawPath(path)
-
-        elif name == "copy":
-            r1 = QRectF(cx - r * 0.25, cy - r * 0.75, r * 1.10, r * 1.20)
-            r2 = QRectF(cx - r * 0.80, cy - r * 0.20, r * 1.10, r * 1.20)
-            painter.drawRoundedRect(r1, 2.5, 2.5)
-            painter.drawRoundedRect(r2, 2.5, 2.5)
-
-        elif name == "edit":
-            p = QPainterPath()
-            p.moveTo(cx - r * 0.75, cy + r * 0.75)
-            p.lineTo(cx - r * 0.35, cy + r * 0.65)
-            p.lineTo(cx + r * 0.72, cy - r * 0.42)
-            p.lineTo(cx + r * 0.42, cy - r * 0.72)
-            p.lineTo(cx - r * 0.65, cy + r * 0.35)
-            p.closeSubpath()
-            painter.drawPath(p)
-
-        elif name == "trash":
-            painter.drawLine(QPointF(cx - r * 0.8, cy - r * 0.5), QPointF(cx + r * 0.8, cy - r * 0.5))
-            body = QRectF(cx - r * 0.6, cy - r * 0.5, r * 1.2, r * 1.35)
-            painter.drawRoundedRect(body, 2.0, 2.0)
-            painter.drawLine(QPointF(cx - r * 0.25, cy - r * 0.8), QPointF(cx + r * 0.25, cy - r * 0.8))
-
-        elif name == "chevron_down":
-            painter.drawLine(QPointF(cx - r * 0.65, cy - r * 0.25), QPointF(cx, cy + r * 0.38))
-            painter.drawLine(QPointF(cx, cy + r * 0.38), QPointF(cx + r * 0.65, cy - r * 0.25))
-
-        elif name == "chevron_left":
-            painter.drawLine(QPointF(cx + r * 0.30, cy - r * 0.65), QPointF(cx - r * 0.35, cy))
-            painter.drawLine(QPointF(cx - r * 0.35, cy), QPointF(cx + r * 0.30, cy + r * 0.65))
-
-        elif name == "sun":
-            painter.drawEllipse(QPointF(cx, cy), r * 0.46, r * 0.46)
-            for i in range(8):
-                ang = i * (math.pi / 4.0)
-                painter.drawLine(
-                    QPointF(cx + math.cos(ang) * r * 0.68, cy + math.sin(ang) * r * 0.68),
-                    QPointF(cx + math.cos(ang) * r * 0.98, cy + math.sin(ang) * r * 0.98),
-                )
-
-        elif name == "moon":
-            path = QPainterPath()
-            path.addEllipse(QPointF(cx, cy), r * 0.85, r * 0.85)
-            cut = QPainterPath()
-            cut.addEllipse(QPointF(cx + r * 0.38, cy - r * 0.28), r * 0.75, r * 0.75)
-            painter.drawPath(path.subtracted(cut))
-
-        elif name == "close":
-            painter.drawLine(QPointF(cx - r * 0.65, cy - r * 0.65), QPointF(cx + r * 0.65, cy + r * 0.65))
-            painter.drawLine(QPointF(cx + r * 0.65, cy - r * 0.65), QPointF(cx - r * 0.65, cy + r * 0.65))
-
-        painter.restore()
-
-
-class RadarShieldCore(QWidget):
-    clicked = Signal()
-
-    def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(215, 215)
-        self.setMaximumSize(245, 245)
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mode = mode
+        self._radius = float(radius)
+        self._depth = float(depth)
+        self._pad = float(pad)
         self._palette: ThemePalette = DARK_PALETTE
-        self._phase = "IDLE"
-        self._country_code = "GLOBAL"
-        self._flag_c1 = QColor("#FFD000")
-        self._flag_c2 = QColor("#38BDF8")
-        self._angle = 0.0
-        self._pulse_phase = 0.0
-        self._glow_intensity = 0.30
+        self.setAutoFillBackground(False)
 
-        self._glow_anim = QPropertyAnimation(self, b"glowIntensity", self)
-        self._glow_anim.setDuration(400)
-        self._glow_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+    def set_neu_mode(self, mode: str) -> None:
+        if mode != self._mode:
+            self._mode = mode
+            self.update()
 
-        self._timer = QTimer(self)
-        self._timer.setInterval(25)
-        self._timer.timeout.connect(self._on_tick)
-        self._timer.start()
-
-    def sizeHint(self) -> QSize:
-        return QSize(226, 226)
-
-    def get_glow_intensity(self) -> float:
-        return self._glow_intensity
-
-    def set_glow_intensity(self, value: float):
-        self._glow_intensity = value
-        self.update()
-
-    glowIntensity = Property(float, get_glow_intensity, set_glow_intensity)
-
-    def set_palette_theme(self, palette: ThemePalette):
+    def set_palette_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
         self.update()
 
-    def set_country_code(self, code: str):
-        norm = str(code or "GLOBAL").upper()
-        self._country_code = norm
-        spec = GeoFlagResolver.get_spec(norm)
-        self._flag_c1 = QColor(spec.c1)
-        self._flag_c2 = QColor(spec.c2)
-        self.update()
-
-    def set_ui_phase(self, phase: str):
-        norm = str(phase or "IDLE").upper()
-        if norm not in ("IDLE", "CONNECTING", "CONNECTED", "ERROR"):
-            norm = "IDLE"
-        if norm == self._phase:
-            return
-        self._phase = norm
-        target = 0.98 if norm == "CONNECTED" else (0.88 if norm == "CONNECTING" else 0.34)
-        self._glow_anim.stop()
-        self._glow_anim.setStartValue(self._glow_intensity)
-        self._glow_anim.setEndValue(target)
-        self._glow_anim.start()
-
-    def _on_tick(self):
-        if self._phase == "CONNECTING":
-            self._angle = (self._angle + 6.4) % 360.0
-            self._pulse_phase = (self._pulse_phase + 0.13) % (2 * math.pi)
-        elif self._phase == "CONNECTED":
-            self._angle = (self._angle + 1.45) % 360.0
-            self._pulse_phase = (self._pulse_phase + 0.055) % (2 * math.pi)
-        else:
-            self._angle = (self._angle + 0.55) % 360.0
-            self._pulse_phase = (self._pulse_phase + 0.032) % (2 * math.pi)
-        self.update()
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit()
-        super().mouseReleaseEvent(event)
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        cx, cy = self.width() / 2.0, self.height() / 2.0
-        max_r = min(cx, cy) - 6.0
-        breath = 0.5 + 0.5 * math.sin(self._pulse_phase)
-
-        gold = QColor(self._palette.accent_primary)
-        orange = QColor("#F97316")
-        emerald = QColor("#10B981")
-        crimson = QColor("#EF4444")
-
-        if self._phase == "CONNECTED":
-            core_color = emerald
-            orbit_color = self._flag_c1
-        elif self._phase == "CONNECTING":
-            core_color = orange
-            orbit_color = gold
-        elif self._phase == "ERROR":
-            core_color = crimson
-            orbit_color = gold
-        else:
-            core_color = self._flag_c1
-            orbit_color = gold
-
-        aura_r = max_r * (0.90 + 0.09 * breath)
-        aura = QRadialGradient(QPointF(cx, cy), aura_r)
-        c_mid = QColor(core_color)
-        c_mid.setAlpha(int(95 * self._glow_intensity + 30 * breath))
-        aura.setColorAt(0.0, c_mid)
-        aura.setColorAt(0.55, QColor(orbit_color.red(), orbit_color.green(), orbit_color.blue(), int(35 * self._glow_intensity)))
-        aura.setColorAt(1.0, QColor(core_color.red(), core_color.green(), core_color.blue(), 0))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(aura)
-        painter.drawEllipse(QPointF(cx, cy), aura_r, aura_r)
-
-        for wave_idx in range(2):
-            wave_prog = ((self._pulse_phase / (2 * math.pi)) + wave_idx * 0.5) % 1.0
-            wave_r = max_r * (0.40 + 0.56 * wave_prog)
-            base_alpha = 185 if self._phase == "CONNECTING" else (120 if self._phase == "CONNECTED" else 55)
-            wave_alpha = int((1.0 - wave_prog) * base_alpha)
-            wave_col = QColor(core_color.red(), core_color.green(), core_color.blue(), wave_alpha)
-            painter.setPen(QPen(wave_col, 1.6))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(QPointF(cx, cy), wave_r, wave_r)
-
-        ticks = 36
-        tick_r_in = max_r * 0.89
-        tick_r_out = max_r * 0.96
-        active_tick = int((self._angle / 360.0) * ticks)
-        for i in range(ticks):
-            ang = math.radians(i * (360.0 / ticks))
-            dist = (i - active_tick) % ticks
-            lit = dist < 8
-            t_col = QColor(orbit_color if lit else core_color)
-            t_col.setAlpha(210 if lit else 55)
-            painter.setPen(QPen(t_col, 2.0 if lit else 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.drawLine(
-                QPointF(cx + math.cos(ang) * tick_r_in, cy + math.sin(ang) * tick_r_in),
-                QPointF(cx + math.cos(ang) * tick_r_out, cy + math.sin(ang) * tick_r_out),
-            )
-
-        painter.save()
-        painter.translate(cx, cy)
-        painter.rotate(self._angle)
-        r_outer = max_r * 0.78
-        seg_pen = QPen(
-            QColor(orbit_color.red(), orbit_color.green(), orbit_color.blue(), 195),
-            2.2,
-            Qt.PenStyle.CustomDashLine,
-            Qt.PenCapStyle.RoundCap,
-        )
-        seg_pen.setDashPattern([10, 8, 2, 8])
-        painter.setPen(seg_pen)
-        painter.drawEllipse(QPointF(0, 0), r_outer, r_outer)
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(orbit_color)
-        painter.drawEllipse(QPointF(r_outer, 0), 3.6, 3.6)
-        painter.setBrush(self._flag_c2)
-        painter.drawEllipse(QPointF(-r_outer, 0), 3.2, 3.2)
-        painter.restore()
-
-        painter.save()
-        painter.translate(cx, cy)
-        painter.rotate(-self._angle * 1.45)
-        r_mid = max_r * 0.62
-        sweep = QConicalGradient(QPointF(0, 0), 0)
-        sweep_alpha = 165 if self._phase == "CONNECTING" else (110 if self._phase == "CONNECTED" else 65)
-        sweep.setColorAt(0.0, QColor(core_color.red(), core_color.green(), core_color.blue(), sweep_alpha))
-        sweep.setColorAt(0.32, QColor(core_color.red(), core_color.green(), core_color.blue(), 0))
-        sweep.setColorAt(1.0, QColor(core_color.red(), core_color.green(), core_color.blue(), 0))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(sweep)
-        painter.drawEllipse(QPointF(0, 0), r_mid, r_mid)
-
-        arc_col = QColor(core_color.red(), core_color.green(), core_color.blue(), 215)
-        painter.setPen(QPen(arc_col, 2.3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        arc_rect = QRectF(-r_mid, -r_mid, r_mid * 2, r_mid * 2)
-        painter.drawArc(arc_rect, 15 * 16, 115 * 16)
-        painter.drawArc(arc_rect, 195 * 16, 115 * 16)
-        painter.restore()
-
-        r_core = max_r * 0.42
-        core_bg = QColor("#101521") if self._palette.is_dark else QColor("#FFFFFF")
-        border_col = (
-            emerald
-            if self._phase == "CONNECTED"
-            else (orange if self._phase == "CONNECTING" else (crimson if self._phase == "ERROR" else gold))
-        )
-        painter.setBrush(core_bg)
-        painter.setPen(QPen(border_col, 2.6))
-        painter.drawEllipse(QPointF(cx, cy), r_core, r_core)
-
-        halo_col = QColor(border_col)
-        halo_col.setAlpha(int(95 + 75 * breath))
-        painter.setPen(QPen(halo_col, 4.0))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawEllipse(QPointF(cx, cy), r_core - 4.5, r_core - 4.5)
-
-        if self._phase == "CONNECTED":
-            icon_name = "lock_closed"
-            lock_color = emerald if not self._palette.is_dark else QColor("#FFFFFF")
-        elif self._phase == "CONNECTING":
-            icon_name = "lock_open"
-            lock_color = orange
-        else:
-            icon_name = "lock_open"
-            lock_color = crimson if self._phase == "ERROR" else gold
-
-        VectorIconPainter.draw_icon(painter, icon_name, QRectF(cx - 21, cy - 21, 42, 42), lock_color, stroke=2.4)
-
-        badge_w, badge_h = 38.0, 25.0
-        bx = cx - r_core * 0.98
-        by = cy + r_core * 0.48
-        plate = QRectF(bx - 3, by - 3, badge_w + 6, badge_h + 6)
-        painter.setPen(QPen(border_col, 1.5))
-        painter.setBrush(core_bg)
-        painter.drawRoundedRect(plate, 8.0, 8.0)
-        VectorFlagRenderer.draw_flag(painter, self._country_code, QRectF(bx, by, badge_w, badge_h), radius=5.0)
-
-
-class TunnelRouteBridgeWidget(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumHeight(62)
-        self.setMaximumHeight(66)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._palette: ThemePalette = DARK_PALETTE
-        self._dest_code = "GLOBAL"
-        self._dest_label = "مسیر جهانی"
-        self._ip_text = ""
-        self._ping_ms = 0
-        self._phase = "IDLE"
-        self._flow_offset = 0.0
-
-        self._timer = QTimer(self)
-        self._timer.setInterval(30)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start()
-
-    def set_palette_theme(self, palette: ThemePalette):
-        self._palette = palette
-        self.update()
-
-    def set_route_state(self, dest_code: str, ip_text: str, ping_ms: int, phase: str):
-        norm = str(dest_code or "GLOBAL").upper()
-        spec = GeoFlagResolver.get_spec(norm)
-        self._dest_code = spec.code
-        self._dest_label = spec.fa_name
-        self._ip_text = str(ip_text or "").strip()
-        self._ping_ms = int(ping_ms or 0)
-        self._phase = str(phase or "IDLE").upper()
-        self.update()
-
-    def _tick(self):
-        speed = 0.036 if self._phase == "CONNECTING" else (0.018 if self._phase == "CONNECTED" else 0.006)
-        self._flow_offset = (self._flow_offset + speed) % 1.0
-        self.update()
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
+    def paintEvent(self, _event) -> None:
         w, h = float(self.width()), float(self.height())
-        if w < 180:
+        if w < 12.0 or h < 12.0:
             return
-
-        spec = GeoFlagResolver.get_spec(self._dest_code)
-        dest_accent = QColor(spec.c1)
-        card_rect = QRectF(1.0, 2.0, w - 2.0, h - 4.0)
-
-        bg = QColor(12, 16, 25, 195) if self._palette.is_dark else QColor(241, 245, 249, 225)
-        border = QColor(dest_accent.red(), dest_accent.green(), dest_accent.blue(), 95 if self._phase == "CONNECTED" else 55)
-        painter.setBrush(bg)
-        painter.setPen(QPen(border, 1.2))
-        painter.drawRoundedRect(card_rect, 15.0, 15.0)
-
-        cy = card_rect.center().y()
-        flag_w, flag_h = 42.0, 28.0
-
-        orig_flag_rect = QRectF(card_rect.right() - 16.0 - flag_w, cy - flag_h / 2.0, flag_w, flag_h)
-        VectorFlagRenderer.draw_flag(painter, "IR", orig_flag_rect, radius=5.5)
-
-        painter.setFont(make_ui_font(9, QFont.Weight.Bold))
-        painter.setPen(QColor(self._palette.text_primary))
-        orig_txt_rect = QRectF(orig_flag_rect.left() - 92.0, card_rect.top() + 8.0, 84.0, 20.0)
-        painter.drawText(orig_txt_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "مبدأ: ایران")
-
-        painter.setFont(make_mono_font(8, bold=False))
-        painter.setPen(QColor(self._palette.text_muted))
-        orig_sub_rect = QRectF(orig_flag_rect.left() - 92.0, cy + 2.0, 84.0, 18.0)
-        painter.drawText(orig_sub_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "LOCAL NODE")
-
-        dest_flag_rect = QRectF(card_rect.left() + 16.0, cy - flag_h / 2.0, flag_w, flag_h)
-        if self._phase == "CONNECTED":
-            halo_rect = dest_flag_rect.adjusted(-3.0, -3.0, 3.0, 3.0)
-            painter.setPen(QPen(QColor("#10B981"), 1.6))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(halo_rect, 7.0, 7.0)
-        VectorFlagRenderer.draw_flag(painter, self._dest_code, dest_flag_rect, radius=5.5)
-
-        painter.setFont(make_ui_font(9, QFont.Weight.Bold))
-        painter.setPen(QColor(self._palette.text_primary))
-        dest_txt_rect = QRectF(dest_flag_rect.right() + 10.0, card_rect.top() + 8.0, 155.0, 20.0)
-        painter.drawText(
-            dest_txt_rect,
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            f"مقصد: {self._dest_label}",
-        )
-
-        painter.setFont(make_mono_font(9, bold=True))
-        sub_ip = self._ip_text if (self._phase == "CONNECTED" and self._ip_text and self._ip_text != "—") else spec.en_name
-        painter.setPen(dest_accent if self._palette.is_dark else QColor(self._palette.text_secondary))
-        dest_sub_rect = QRectF(dest_flag_rect.right() + 10.0, cy + 2.0, 155.0, 18.0)
-        painter.drawText(dest_sub_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, sub_ip)
-
-        track_right = orig_txt_rect.left() - 14.0
-        track_left = dest_txt_rect.right() + 14.0
-        if track_right - track_left > 50.0:
-            base_line_col = QColor(255, 255, 255, 32) if self._palette.is_dark else QColor(15, 23, 42, 28)
-            painter.setPen(QPen(base_line_col, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.drawLine(QPointF(track_right, cy), QPointF(track_left, cy))
-
-            active_col = (
-                QColor("#10B981")
-                if self._phase == "CONNECTED"
-                else (QColor("#F97316") if self._phase == "CONNECTING" else dest_accent)
+        painter = QPainter(self)
+        p = self._pad
+        inner = QRectF(p, p, w - 2.0 * p, h - 2.0 * p)
+        if self._mode == "inset":
+            draw_neu_inset(painter, inner, self._radius, self._palette, depth=self._depth)
+        elif self._mode == "dock":
+            draw_neu_raised(
+                painter,
+                inner,
+                self._radius,
+                self._palette,
+                depth=self._depth,
+                accent_tint=QColor(self._palette.accent_primary),
             )
-
-            span = track_right - track_left
-            num_pulses = 4
-            for i in range(num_pulses):
-                prog = (self._flow_offset + i / num_pulses) % 1.0
-                px = track_right - prog * span
-                alpha = int(255 * math.sin(prog * math.pi))
-                dot_col = QColor(active_col.red(), active_col.green(), active_col.blue(), alpha)
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(dot_col)
-                r_dot = 3.6 if self._phase in ("CONNECTING", "CONNECTED") else 2.4
-                painter.drawEllipse(QPointF(px, cy), r_dot, r_dot)
-
-            if self._phase == "CONNECTED" and self._ping_ms > 0:
-                pill_txt = f"ENCRYPTED • {self._ping_ms} ms"
-            elif self._phase == "CONNECTING":
-                pill_txt = "SCANNING TUNNEL..."
-            else:
-                pill_txt = f"READY • {spec.code}"
-
-            painter.setFont(make_mono_font(8, bold=True))
-            fm = QFontMetrics(painter.font())
-            pw = fm.horizontalAdvance(pill_txt) + 18.0
-            mid_x = (track_left + track_right) / 2.0
-            pill_rect = QRectF(mid_x - pw / 2.0, cy - 10.0, pw, 20.0)
-            pill_bg = QColor("#0E131D") if self._palette.is_dark else QColor("#FFFFFF")
-            painter.setBrush(pill_bg)
-            painter.setPen(QPen(active_col, 1.1))
-            painter.drawRoundedRect(pill_rect, 10.0, 10.0)
-            painter.setPen(active_col if self._palette.is_dark else QColor("#0F172A"))
-            painter.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, pill_txt)
-
-
-class AnimatedHeroConnectionCard(QFrame):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("HeroCard")
-        self._palette: ThemePalette = DARK_PALETTE
-        self._phase = "IDLE"
-        self._country_code = "GLOBAL"
-
-        self._cur_c1 = QColor("#FFD000")
-        self._cur_c2 = QColor("#38BDF8")
-        self._cur_c3 = QColor("#10B981")
-        self._target_c1 = QColor("#FFD000")
-        self._target_c2 = QColor("#38BDF8")
-        self._target_c3 = QColor("#10B981")
-
-        self._wave_t = 0.0
-        rng = random.Random(77)
-        self._motes = [
-            {
-                "x": rng.uniform(0.03, 0.97),
-                "y": rng.uniform(0.08, 0.92),
-                "vx": rng.uniform(-0.0028, -0.0007),
-                "vy": rng.uniform(-0.0018, 0.0018),
-                "r": rng.uniform(1.2, 2.8),
-                "slot": i % 3,
-                "phase": rng.uniform(0, 2 * math.pi),
-            }
-            for i in range(28)
-        ]
-
-        self._timer = QTimer(self)
-        self._timer.setInterval(32)
-        self._timer.timeout.connect(self._on_tick)
-        self._timer.start()
-
-    def set_palette_theme(self, palette: ThemePalette):
-        self._palette = palette
-        self.update()
-
-    def set_visual_context(self, country_code: str, phase: str):
-        norm_code = str(country_code or "GLOBAL").upper()
-        spec = GeoFlagResolver.get_spec(norm_code)
-        self._country_code = spec.code
-        self._target_c1 = QColor(spec.c1)
-        self._target_c2 = QColor(spec.c2)
-        self._target_c3 = QColor(spec.c3)
-        self._phase = str(phase or "IDLE").upper()
-        self.update()
-
-    def _on_tick(self):
-        speed_mult = 2.6 if self._phase == "CONNECTING" else (1.55 if self._phase == "CONNECTED" else 0.75)
-        self._wave_t = (self._wave_t + 0.035 * speed_mult) % (2 * math.pi * 10)
-
-        self._cur_c1 = _lerp_color(self._cur_c1, self._target_c1, 0.09)
-        self._cur_c2 = _lerp_color(self._cur_c2, self._target_c2, 0.09)
-        self._cur_c3 = _lerp_color(self._cur_c3, self._target_c3, 0.09)
-
-        for m in self._motes:
-            m["x"] = (m["x"] + m["vx"] * speed_mult) % 1.0
-            m["y"] = (m["y"] + m["vy"] * speed_mult) % 1.0
-            m["phase"] = (m["phase"] + 0.08 * speed_mult) % (2 * math.pi)
-        self.update()
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        rect = QRectF(1.0, 1.0, self.width() - 2.0, self.height() - 2.0)
-        radius = 20.0
-        clip = QPainterPath()
-        clip.addRoundedRect(rect, radius, radius)
-        painter.setClipPath(clip)
-
-        base_grad = QLinearGradient(rect.topRight(), rect.bottomLeft())
-        if self._palette.is_dark:
-            base_grad.setColorAt(0.0, QColor("#0D121C"))
-            base_grad.setColorAt(0.55, QColor("#111827"))
-            base_grad.setColorAt(1.0, QColor("#0B0F18"))
         else:
-            base_grad.setColorAt(0.0, QColor("#FFFFFF"))
-            base_grad.setColorAt(1.0, QColor("#F1F5F9"))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(base_grad)
-        painter.drawRect(rect)
-
-        grid_alpha = 15 if self._palette.is_dark else 12
-        grid_pen = QPen(QColor(255, 255, 255, grid_alpha) if self._palette.is_dark else QColor(15, 23, 42, grid_alpha), 1.0)
-        painter.setPen(grid_pen)
-        step = 38
-        for gx in range(int(rect.left()), int(rect.right()), step):
-            painter.drawLine(gx, int(rect.top()), gx, int(rect.bottom()))
-        for gy in range(int(rect.top()), int(rect.bottom()), step):
-            painter.drawLine(int(rect.left()), gy, int(rect.right()), gy)
-
-        aura_boost = 1.35 if self._phase == "CONNECTED" else (1.15 if self._phase == "CONNECTING" else 0.80)
-        halo_left = QRadialGradient(QPointF(rect.left() + rect.width() * 0.22, rect.center().y()), rect.width() * 0.45)
-        c1_glow = QColor(self._cur_c1)
-        c1_glow.setAlpha(int((54 if self._palette.is_dark else 34) * aura_boost))
-        halo_left.setColorAt(0.0, c1_glow)
-        halo_left.setColorAt(1.0, QColor(c1_glow.red(), c1_glow.green(), c1_glow.blue(), 0))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(halo_left)
-        painter.drawRect(rect)
-
-        halo_right = QRadialGradient(QPointF(rect.right() - 140.0, rect.center().y()), rect.height() * 0.85)
-        right_base = QColor("#10B981") if self._phase == "CONNECTED" else (QColor("#F97316") if self._phase == "CONNECTING" else self._cur_c2)
-        right_base.setAlpha(int((48 if self._palette.is_dark else 28) * aura_boost))
-        halo_right.setColorAt(0.0, right_base)
-        halo_right.setColorAt(1.0, QColor(right_base.red(), right_base.green(), right_base.blue(), 0))
-        painter.setBrush(halo_right)
-        painter.drawRect(rect)
-
-        colors = (self._cur_c1, self._cur_c2, self._cur_c3)
-        for idx, wave_col in enumerate(colors):
-            ribbon = QPainterPath()
-            base_y = rect.bottom() - (28.0 + idx * 22.0)
-            ribbon.moveTo(rect.left(), rect.bottom())
-            ribbon.lineTo(rect.left(), base_y)
-            segs = 18
-            for s in range(segs + 1):
-                sx = rect.left() + (s / segs) * rect.width()
-                sy = base_y + math.sin(s * 0.55 + self._wave_t * (0.9 + idx * 0.25) + idx * 1.4) * (14.0 + idx * 5.0)
-                ribbon.lineTo(sx, sy)
-            ribbon.lineTo(rect.right(), rect.bottom())
-            ribbon.closeSubpath()
-
-            fill = QColor(wave_col)
-            fill.setAlpha(int((26 - idx * 5) * aura_boost) if self._palette.is_dark else int((18 - idx * 3) * aura_boost))
-            painter.setBrush(fill)
-            painter.setPen(QPen(QColor(wave_col.red(), wave_col.green(), wave_col.blue(), int(55 * aura_boost)), 1.1))
-            painter.drawPath(ribbon)
-
-        painter.save()
-        crest_w, crest_h = 184.0, 120.0
-        painter.translate(rect.left() + 125.0, rect.bottom() - 82.0)
-        painter.rotate(-9.0)
-        crest_rect = QRectF(-crest_w / 2.0, -crest_h / 2.0, crest_w, crest_h)
-        crest_opacity = 0.20 if self._phase == "CONNECTED" else 0.13
-        if not self._palette.is_dark:
-            crest_opacity *= 0.75
-        VectorFlagRenderer.draw_flag(painter, self._country_code, crest_rect, radius=14.0, opacity=crest_opacity, with_border=True)
-        painter.restore()
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        for m in self._motes:
-            m_col = QColor(colors[m["slot"]])
-            twinkle = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(m["phase"]))
-            m_col.setAlpha(int(155 * twinkle))
-            painter.setBrush(m_col)
-            px = rect.left() + m["x"] * rect.width()
-            py = rect.top() + m["y"] * rect.height()
-            painter.drawEllipse(QPointF(px, py), m["r"], m["r"])
-
-        painter.setClipping(False)
-        rim_grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
-        rim_left = QColor(self._cur_c1)
-        rim_left.setAlpha(155 if self._phase == "CONNECTED" else 105)
-        rim_right = QColor("#10B981") if self._phase == "CONNECTED" else (QColor("#F97316") if self._phase == "CONNECTING" else QColor(self._palette.accent_primary))
-        rim_right.setAlpha(155)
-        rim_grad.setColorAt(0.0, rim_left)
-        rim_grad.setColorAt(1.0, rim_right)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(rim_grad, 1.6))
-        painter.drawRoundedRect(rect, radius, radius)
-
-
-class KineticConnectButton(QPushButton):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(56)
-        self.setMaximumHeight(60)
-        self.setMinimumWidth(285)
-        self._palette: ThemePalette = DARK_PALETTE
-        self._phase = "IDLE"
-        self._hover_level = 0.0
-        self._shimmer_pos = -0.35
-        self._spinner_angle = 0.0
-        self._pulse_phase = 0.0
-
-        self._hover_anim = QPropertyAnimation(self, b"hoverLevel", self)
-        self._hover_anim.setDuration(240)
-        self._hover_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-
-        self._shimmer_anim = QPropertyAnimation(self, b"shimmerPos", self)
-        self._shimmer_anim.setDuration(900)
-        self._shimmer_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
-
-        self._kinetic_timer = QTimer(self)
-        self._kinetic_timer.setInterval(28)
-        self._kinetic_timer.timeout.connect(self._on_kinetic_tick)
-        self._kinetic_timer.start()
-
-        self.setFont(make_ui_font(12, QFont.Weight.ExtraBold))
-        self.set_phase_and_label("IDLE", "")
-
-    def get_hover_level(self) -> float:
-        return self._hover_level
-
-    def set_hover_level(self, val: float):
-        self._hover_level = val
-        self.update()
-
-    hoverLevel = Property(float, get_hover_level, set_hover_level)
-
-    def get_shimmer_pos(self) -> float:
-        return self._shimmer_pos
-
-    def set_shimmer_pos(self, val: float):
-        self._shimmer_pos = val
-        self.update()
-
-    shimmerPos = Property(float, get_shimmer_pos, set_shimmer_pos)
-
-    def set_palette_theme(self, palette: ThemePalette):
-        self._palette = palette
-        self.update()
-
-    def _on_kinetic_tick(self):
-        if self._phase == "CONNECTING":
-            self._spinner_angle = (self._spinner_angle + 11.0) % 360.0
-            self._pulse_phase = (self._pulse_phase + 0.15) % (2 * math.pi)
-            self.update()
-        else:
-            self._pulse_phase = (self._pulse_phase + 0.045) % (2 * math.pi)
-            if self._hover_level > 0.01:
-                self.update()
-
-    def _trigger_shimmer_sweep(self):
-        self._shimmer_anim.stop()
-        self._shimmer_anim.setStartValue(-0.35)
-        self._shimmer_anim.setEndValue(1.35)
-        self._shimmer_anim.start()
-
-    def set_phase_and_label(self, phase: str, custom_label: str = ""):
-        norm = str(phase or "IDLE").upper()
-        if norm not in ("IDLE", "CONNECTING", "CONNECTED", "ERROR"):
-            norm = "IDLE"
-        self._phase = norm
-
-        if norm == "CONNECTING":
-            label = "لغو فرایند (کلیک برای توقف)"
-            if custom_label and "لغو" in custom_label and "توقف" in custom_label:
-                label = custom_label
-            self.setText(label)
-        elif norm == "CONNECTED":
-            label = "قطع اتصال امن"
-            if custom_label and "امن" in custom_label:
-                label = custom_label
-            self.setText(label)
-        else:
-            self.setText(custom_label if custom_label else "اتصال هوشمند")
-        self.update()
-
-    def enterEvent(self, event):
-        self._hover_anim.stop()
-        self._hover_anim.setStartValue(self._hover_level)
-        self._hover_anim.setEndValue(1.0)
-        self._hover_anim.start()
-        self._trigger_shimmer_sweep()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self._hover_anim.stop()
-        self._hover_anim.setStartValue(self._hover_level)
-        self._hover_anim.setEndValue(0.0)
-        self._hover_anim.start()
-        super().leaveEvent(event)
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        pad = 5.0
-        rect = QRectF(pad, pad, self.width() - 2 * pad, self.height() - 2 * pad)
-        radius = rect.height() / 2.0
-        breath = 0.5 + 0.5 * math.sin(self._pulse_phase)
-
-        if self._phase == "CONNECTING":
-            glow_col = QColor(249, 115, 22, int(65 + 55 * breath + 35 * self._hover_level))
-            grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
-            grad.setColorAt(0.0, QColor("#FB923C") if self._hover_level > 0.5 else QColor("#F97316"))
-            grad.setColorAt(1.0, QColor("#DC2626") if self._hover_level > 0.5 else QColor("#EF4444"))
-            rim_col = QColor(255, 237, 160, int(145 + 100 * breath))
-            text_col = QColor("#FFFFFF")
-            icon_name = "spinner"
-        elif self._phase == "CONNECTED":
-            glow_col = QColor(16, 185, 129, int(55 + 45 * self._hover_level))
-            grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
-            grad.setColorAt(0.0, QColor("#10B981"))
-            grad.setColorAt(0.65, QColor("#059669"))
-            grad.setColorAt(1.0, QColor("#047857"))
-            rim_col = QColor("#FCD34D") if self._hover_level > 0.35 else QColor("#34D399")
-            text_col = QColor("#FFFFFF")
-            icon_name = "shield_check"
-        else:
-            glow_col = QColor(255, 208, 0, int(52 + 62 * self._hover_level))
-            grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
-            grad.setColorAt(0.0, QColor("#FFE55C") if self._hover_level > 0.3 else QColor("#FFD000"))
-            grad.setColorAt(0.55, QColor("#FFC300"))
-            grad.setColorAt(1.0, QColor("#F59E0B"))
-            rim_col = QColor(255, 255, 255, int(130 + 85 * self._hover_level))
-            text_col = QColor("#090B10")
-            icon_name = "power"
-
-        outer_rect = rect.adjusted(-4.0, -4.0, 4.0, 4.0)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(glow_col)
-        painter.drawRoundedRect(outer_rect, radius + 4.0, radius + 4.0)
-
-        capsule_path = QPainterPath()
-        capsule_path.addRoundedRect(rect, radius, radius)
-
-        painter.setBrush(grad)
-        painter.setPen(QPen(rim_col, 1.8))
-        painter.drawPath(capsule_path)
-
-        if -0.30 < self._shimmer_pos < 1.30:
-            painter.save()
-            painter.setClipPath(capsule_path)
-            band_cx = rect.left() + rect.width() * self._shimmer_pos
-            band_w = rect.width() * 0.28
-            shimmer_grad = QLinearGradient(
-                QPointF(band_cx - band_w, rect.top()),
-                QPointF(band_cx + band_w, rect.bottom()),
-            )
-            shimmer_grad.setColorAt(0.0, QColor(255, 255, 255, 0))
-            shimmer_grad.setColorAt(0.5, QColor(255, 255, 255, 115 if self._phase != "CONNECTED" else 85))
-            shimmer_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(shimmer_grad)
-            painter.drawRect(rect)
-            painter.restore()
-
-        painter.setFont(self.font())
-        fm = QFontMetrics(self.font())
-        label = self.text()
-        text_w = fm.horizontalAdvance(label)
-        icon_dim = 20.0
-        gap = 10.0
-        total_w = text_w + gap + icon_dim
-        start_x = rect.center().x() - total_w / 2.0
-
-        icon_rect = QRectF(start_x + text_w + gap, rect.center().y() - icon_dim / 2.0, icon_dim, icon_dim)
-        text_rect = QRectF(start_x, rect.top(), text_w + 4.0, rect.height())
-
-        painter.setPen(text_col)
-        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, label)
-        VectorIconPainter.draw_icon(
-            painter,
-            icon_name,
-            icon_rect,
-            text_col,
-            stroke=2.1,
-            angle=self._spinner_angle,
-        )
-
-
-PrimaryConnectButton = KineticConnectButton
-
-
-class SimpleChronometerWidget(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumSize(158, 46)
-        self.setMaximumHeight(48)
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self._palette: ThemePalette = DARK_PALETTE
-        self._uptime_label = "00:00:00"
-        self._is_connected = False
-        self._pulse = 0.0
-
-        self._timer = QTimer(self)
-        self._timer.setInterval(50)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start()
-
-    def sizeHint(self) -> QSize:
-        return QSize(164, 46)
-
-    def _tick(self):
-        if self._is_connected:
-            self._pulse = (self._pulse + 0.14) % (2 * math.pi)
-            self.update()
-
-    def set_palette_theme(self, palette: ThemePalette):
-        self._palette = palette
-        self.update()
-
-    def set_uptime_state(self, uptime_label: str, is_connected: bool):
-        clean = str(uptime_label or "").strip()
-        self._uptime_label = clean if clean else "00:00:00"
-        self._is_connected = bool(is_connected)
-        self.update()
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        rect = QRectF(1.5, 2.0, self.width() - 3.0, self.height() - 4.0)
-        radius = rect.height() / 2.0
-
-        bg = QColor(12, 16, 25, 215) if self._palette.is_dark else QColor(241, 245, 249, 240)
-        border = (
-            QColor(16, 185, 129, 145)
-            if self._is_connected
-            else (QColor(255, 255, 255, 34) if self._palette.is_dark else QColor(15, 23, 42, 32))
-        )
-        painter.setBrush(bg)
-        painter.setPen(QPen(border, 1.3))
-        painter.drawRoundedRect(rect, radius, radius)
-
-        dot_col = QColor("#10B981") if self._is_connected else QColor(self._palette.text_muted)
-        dot_center = QPointF(rect.left() + 18.0, rect.center().y())
-        if self._is_connected:
-            halo_alpha = int(55 + 75 * (0.5 + 0.5 * math.sin(self._pulse)))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(16, 185, 129, halo_alpha))
-            painter.drawEllipse(dot_center, 6.2, 6.2)
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(dot_col)
-        painter.drawEllipse(dot_center, 3.2, 3.2)
-
-        clock_rect = QRectF(rect.right() - 28.0, rect.center().y() - 8.5, 17.0, 17.0)
-        clock_col = QColor(self._palette.accent_primary) if self._is_connected else QColor(self._palette.text_muted)
-        VectorIconPainter.draw_icon(painter, "clock", clock_rect, clock_col, stroke=1.7)
-
-        txt_rect = QRectF(rect.left() + 28.0, rect.top(), rect.width() - 60.0, rect.height())
-        painter.setFont(make_mono_font(12, bold=True))
-        painter.setPen(
-            QColor(self._palette.text_primary) if self._is_connected else QColor(self._palette.text_secondary)
-        )
-        painter.drawText(txt_rect, Qt.AlignmentFlag.AlignCenter, self._uptime_label)
-
-
-SpoilerChronometerWidget = SimpleChronometerWidget
-
-
-class SpinnerGlyphWidget(QWidget):
-    def __init__(self, size: int = 18, parent=None):
-        super().__init__(parent)
-        lock_widget_dimensions(self, size, size)
-        self._palette: ThemePalette = DARK_PALETTE
-        self._angle = 0.0
-        self._timer = QTimer(self)
-        self._timer.setInterval(30)
-        self._timer.timeout.connect(self._tick)
-
-    def set_running(self, running: bool):
-        if running and not self._timer.isActive():
-            self._timer.start()
-        elif not running and self._timer.isActive():
-            self._timer.stop()
-        self.update()
-
-    def set_palette_theme(self, palette: ThemePalette):
-        self._palette = palette
-        self.update()
-
-    def _tick(self):
-        self._angle = (self._angle + 12.0) % 360.0
-        self.update()
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        col = QColor(self._palette.accent_primary)
-        VectorIconPainter.draw_icon(
-            painter,
-            "spinner",
-            QRectF(1, 1, self.width() - 2, self.height() - 2),
-            col,
-            stroke=1.8,
-            angle=self._angle,
-        )
-
-
-class TaskProgressStrip(QFrame):
-    stop_requested = Signal()
-
-    def __init__(self, inline_style: bool = False, parent=None):
-        super().__init__(parent)
-        self.setObjectName("InlineTaskBar" if inline_style else "GlobalTaskBar")
-        self._target_height = 42 if inline_style else 38
-        self._palette: ThemePalette = DARK_PALETTE
-        self.setMaximumHeight(0)
-        self.hide()
-
-        self._height_anim = QPropertyAnimation(self, b"maximumHeight", self)
-        self._height_anim.setDuration(240)
-        self._height_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._height_anim.finished.connect(self._on_anim_finished)
-
-        self._hide_delay = QTimer(self)
-        self._hide_delay.setSingleShot(True)
-        self._hide_delay.setInterval(420)
-        self._hide_delay.timeout.connect(self._collapse_now)
-
-        self._active = False
-
-        row = QHBoxLayout(self)
-        row.setContentsMargins(16, 5, 16, 5)
-        row.setSpacing(10)
-
-        self.spinner = SpinnerGlyphWidget(size=18)
-
-        self.msg_lbl = QLabel("در حال اجرای عملیات...")
-        self.msg_lbl.setObjectName("SecondaryLabel")
-
-        self.bar = QProgressBar()
-        self.bar.setObjectName("GoldProgress")
-        self.bar.setRange(0, 100)
-        self.bar.setValue(0)
-        self.bar.setTextVisible(False)
-        self.bar.setMinimumWidth(160)
-        self.bar.setMaximumWidth(280)
-        self.bar.setMinimumHeight(7)
-        self.bar.setMaximumHeight(8)
-        enforce_english_ltr(self.bar, mono_size=9)
-
-        self.pct_lbl = QLabel("0%")
-        self.pct_lbl.setObjectName("BadgePill")
-        enforce_english_ltr(self.pct_lbl, mono_size=10, bold=True)
-
-        self.stop_btn = QPushButton("توقف")
-        self.stop_btn.setObjectName("DangerPillBtn")
-        self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.stop_btn.clicked.connect(self.stop_requested.emit)
-
-        row.addWidget(self.spinner)
-        row.addWidget(self.msg_lbl, 1)
-        row.addWidget(self.bar)
-        row.addWidget(self.pct_lbl)
-        row.addWidget(self.stop_btn)
-
-    def set_palette_theme(self, palette: ThemePalette):
-        self._palette = palette
-        self.spinner.set_palette_theme(palette)
-
-    def update_task_state(self, active: bool, percent: int, message: str):
-        clamped = max(0, min(100, int(percent or 0)))
-        self.bar.setValue(clamped)
-        self.pct_lbl.setText(f"{clamped}%")
-        if message:
-            self.msg_lbl.setText(sanitize_ui_text(message))
-
-        if active:
-            self._hide_delay.stop()
-            self._active = True
-            self.spinner.set_running(True)
-            if not self.isVisible() or self.maximumHeight() < self._target_height:
-                self.show()
-                self._height_anim.stop()
-                self._height_anim.setStartValue(self.maximumHeight())
-                self._height_anim.setEndValue(self._target_height)
-                self._height_anim.start()
-        else:
-            self._active = False
-            self.spinner.set_running(False)
-            if self.isVisible():
-                self._hide_delay.start()
-
-    def _collapse_now(self):
-        if self._active:
-            return
-        self._height_anim.stop()
-        self._height_anim.setStartValue(self.maximumHeight())
-        self._height_anim.setEndValue(0)
-        self._height_anim.start()
-
-    def _on_anim_finished(self):
-        if not self._active and self.maximumHeight() == 0:
-            self.hide()
-
-
-class ActionIconPillButton(QPushButton):
-    def __init__(self, icon_name: str, text: str, golden: bool = True, parent=None):
-        super().__init__(text, parent)
-        self._icon_name = icon_name
-        self._golden = golden
-        self._hovered = False
-        self._palette: ThemePalette = DARK_PALETTE
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(35)
-        self.setMaximumHeight(37)
-        self.setFont(make_ui_font(9, QFont.Weight.Bold))
-        fm = QFontMetrics(self.font())
-        self.setMinimumWidth(fm.horizontalAdvance(text) + 48)
-
-    def set_palette_theme(self, palette: ThemePalette):
-        self._palette = palette
-        self.update()
-
-    def enterEvent(self, event):
-        self._hovered = True
-        self.update()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self._hovered = False
-        self.update()
-        super().leaveEvent(event)
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        rect = QRectF(1.0, 1.0, self.width() - 2.0, self.height() - 2.0)
-        radius = 11.0
-
-        if self._golden:
-            grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
-            grad.setColorAt(0.0, QColor("#FFE352") if self._hovered else QColor("#FFD000"))
-            grad.setColorAt(1.0, QColor("#F59E0B"))
-            painter.setPen(QPen(QColor(255, 255, 255, 90 if self._hovered else 45), 1.0))
-            painter.setBrush(grad)
-            painter.drawRoundedRect(rect, radius, radius)
-            fg = QColor("#090B10")
-        else:
-            bg = QColor(255, 208, 0, 42 if self._hovered else 24)
-            painter.setPen(QPen(QColor(self._palette.accent_primary), 1.2))
-            painter.setBrush(bg)
-            painter.drawRoundedRect(rect, radius, radius)
-            fg = QColor(self._palette.accent_primary) if self._palette.is_dark else QColor("#9A6B00")
-
-        icon_rect = QRectF(rect.right() - 26.0, rect.center().y() - 8.5, 17.0, 17.0)
-        VectorIconPainter.draw_icon(painter, self._icon_name, icon_rect, fg, stroke=1.7)
-
-        txt_rect = QRectF(rect.left() + 10.0, rect.top(), rect.width() - 40.0, rect.height())
-        painter.setPen(fg)
-        painter.setFont(self.font())
-        painter.drawText(txt_rect, Qt.AlignmentFlag.AlignCenter, self.text())
-
-
-class LiveSparklineWidget(QWidget):
-    def __init__(self, max_points: int = 34, parent=None):
-        super().__init__(parent)
-        self._max_points = max_points
-        self._samples = deque([0.0] * max_points, maxlen=max_points)
-        self._palette: ThemePalette = DARK_PALETTE
-        self._secondary_tint = False
-        self.setMinimumHeight(34)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
-    def set_palette_theme(self, palette: ThemePalette, secondary_tint: bool = False):
-        self._palette = palette
-        self._secondary_tint = secondary_tint
-        self.update()
-
-    def push_sample(self, value: float):
-        clean_val = max(0.0, float(value or 0.0))
-        self._samples.append(clean_val)
-        self.update()
-
-    def reset_flat(self):
-        if any(v > 0.0 for v in self._samples):
-            self._samples = deque([0.0] * self._max_points, maxlen=self._max_points)
-            self.update()
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        w, h = self.width(), self.height()
-        if w < 10 or h < 10 or len(self._samples) < 2:
-            return
-
-        pad_x, pad_top, pad_bot = 4.0, 5.0, 5.0
-        usable_w = w - 2 * pad_x
-        usable_h = h - pad_top - pad_bot
-        baseline_y = pad_top + usable_h
-
-        line_color = (
-            QColor("#FFFFFF")
-            if (self._secondary_tint and self._palette.is_dark)
-            else QColor(self._palette.accent_primary)
-        )
-
-        peak = max(self._samples)
-        if peak <= 0.0001:
-            flat_col = QColor(line_color)
-            flat_col.setAlpha(65)
-            painter.setPen(QPen(flat_col, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.drawLine(QPointF(pad_x, baseline_y), QPointF(w - pad_x, baseline_y))
-            return
-
-        pts = []
-        n = len(self._samples)
-        for idx, val in enumerate(self._samples):
-            x = pad_x + (idx / (n - 1)) * usable_w
-            norm = min(val / (peak * 1.12), 1.0)
-            y = pad_top + usable_h * (1.0 - norm)
-            pts.append(QPointF(x, y))
-
-        line_path = QPainterPath(pts[0])
-        for i in range(len(pts) - 1):
-            p0, p1 = pts[i], pts[i + 1]
-            mid_x = (p0.x() + p1.x()) / 2.0
-            line_path.cubicTo(QPointF(mid_x, p0.y()), QPointF(mid_x, p1.y()), p1)
-
-        fill_path = QPainterPath(line_path)
-        fill_path.lineTo(pts[-1].x(), baseline_y)
-        fill_path.lineTo(pts[0].x(), baseline_y)
-        fill_path.closeSubpath()
-
-        grad = QLinearGradient(0, pad_top, 0, h)
-        top_fill = QColor(line_color)
-        top_fill.setAlpha(75 if self._palette.is_dark else 55)
-        bot_fill = QColor(line_color)
-        bot_fill.setAlpha(0)
-        grad.setColorAt(0.0, top_fill)
-        grad.setColorAt(1.0, bot_fill)
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(grad)
-        painter.drawPath(fill_path)
-
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(line_color, 1.9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.drawPath(line_path)
-
-        if self._samples[-1] > 0.0:
-            tip = pts[-1]
-            painter.setPen(Qt.PenStyle.NoPen)
-            halo = QColor(line_color)
-            halo.setAlpha(95)
-            painter.setBrush(halo)
-            painter.drawEllipse(tip, 4.6, 4.6)
-            painter.setBrush(line_color)
-            painter.drawEllipse(tip, 2.2, 2.2)
-
-
-class AnimatedToggleSwitch(QAbstractButton):
-    def __init__(self, checked: bool = False, parent=None):
-        super().__init__(parent)
-        self.setCheckable(True)
-        self.setChecked(checked)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        lock_widget_dimensions(self, 46, 25)
-        self._palette: ThemePalette = DARK_PALETTE
-        self._offset = 1.0 if checked else 0.0
-
-        self._anim = QPropertyAnimation(self, b"knobOffset", self)
-        self._anim.setDuration(200)
-        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self.toggled.connect(self._animate_state)
-
-    def get_knob_offset(self) -> float:
-        return self._offset
-
-    def set_knob_offset(self, val: float):
-        self._offset = val
-        self.update()
-
-    knobOffset = Property(float, get_knob_offset, set_knob_offset)
-
-    def set_CheckedSilent(self, checked: bool):
-        self.blockSignals(True)
-        self.setChecked(checked)
-        self._offset = 1.0 if checked else 0.0
-        self.blockSignals(False)
-        self.update()
-
-    def set_palette_theme(self, palette: ThemePalette):
-        self._palette = palette
-        self.update()
-
-    def _animate_state(self, checked: bool):
-        self._anim.stop()
-        self._anim.setStartValue(self._offset)
-        self._anim.setEndValue(1.0 if checked else 0.0)
-        self._anim.start()
-
-    def sizeHint(self) -> QSize:
-        return QSize(46, 25)
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        rect = QRectF(1.0, 1.0, self.width() - 2.0, self.height() - 2.0)
-        radius = rect.height() / 2.0
-
-        off_bg = QColor("#1E293B") if self._palette.is_dark else QColor("#CBD5E1")
-        on_bg = QColor(self._palette.accent_primary)
-
-        r = int(off_bg.red() + (on_bg.red() - off_bg.red()) * self._offset)
-        g = int(off_bg.green() + (on_bg.green() - off_bg.green()) * self._offset)
-        b = int(off_bg.blue() + (on_bg.blue() - off_bg.blue()) * self._offset)
-        track_col = QColor(r, g, b)
-
-        painter.setPen(
-            QPen(QColor(255, 255, 255, 28) if self._palette.is_dark else QColor(15, 23, 42, 22), 1.0)
-        )
-        painter.setBrush(track_col)
-        painter.drawRoundedRect(rect, radius, radius)
-
-        knob_d = rect.height() - 5.0
-        min_x = rect.left() + 2.5
-        max_x = rect.right() - knob_d - 2.5
-        knob_x = min_x + (max_x - min_x) * self._offset
-        knob_rect = QRectF(knob_x, rect.top() + 2.5, knob_d, knob_d)
-
-        knob_col = QColor("#090B10") if (self._offset > 0.5 and self._palette.is_dark) else QColor("#FFFFFF")
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(knob_col)
-        painter.drawEllipse(knob_rect)
-
-
-class NavRailButton(QAbstractButton):
-    def __init__(self, icon_name: str, title: str, parent=None):
-        super().__init__(parent)
-        self._icon_name = icon_name
-        self._title = title
-        self._palette: ThemePalette = DARK_PALETTE
-        self._hovered = False
-        self.setCheckable(True)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        lock_widget_dimensions(self, 78, 62)
-
-    def sizeHint(self) -> QSize:
-        return QSize(78, 62)
-
-    def set_palette_theme(self, palette: ThemePalette):
-        self._palette = palette
-        self.update()
-
-    def enterEvent(self, event):
-        self._hovered = True
-        self.update()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self._hovered = False
-        self.update()
-        super().leaveEvent(event)
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        rect = QRectF(5, 3, self.width() - 10, self.height() - 6)
-
-        active = self.isChecked()
-        accent = QColor(self._palette.accent_primary)
-
-        if active:
-            bg = QColor(accent.red(), accent.green(), accent.blue(), 34 if self._palette.is_dark else 44)
-            painter.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 95), 1.0))
-            painter.setBrush(bg)
-            painter.drawRoundedRect(rect, 13, 13)
-
-            pill = QRectF(self.width() - 4.2, 16, 3.0, self.height() - 32)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(accent)
-            painter.drawRoundedRect(pill, 1.5, 1.5)
-        elif self._hovered:
-            bg = QColor(255, 255, 255, 12) if self._palette.is_dark else QColor(15, 23, 42, 10)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(bg)
-            painter.drawRoundedRect(rect, 13, 13)
-
-        icon_col = (
-            accent
-            if (active and self._palette.is_dark)
-            else (QColor("#9A6B00") if active else QColor(self._palette.text_muted))
-        )
-        if self._hovered and not active:
-            icon_col = QColor(self._palette.text_primary)
-
-        icon_rect = QRectF((self.width() - 22) / 2, 8, 22, 22)
-        VectorIconPainter.draw_icon(painter, self._icon_name, icon_rect, icon_col, stroke=1.8)
-
-        painter.setPen(icon_col)
-        painter.setFont(make_ui_font(9, QFont.Weight.Bold if active else QFont.Weight.Medium))
-        painter.drawText(QRectF(2, 33, self.width() - 4, 23), Qt.AlignmentFlag.AlignCenter, self._title)
+            draw_neu_raised(painter, inner, self._radius, self._palette, depth=self._depth)
 
 
 class VectorIconButton(QAbstractButton):
-    def __init__(self, icon_name: str, size: int = 32, danger_hover: bool = False, parent=None):
+    def __init__(self, icon_name: str, size: int = 34, danger_hover: bool = False, parent=None):
         super().__init__(parent)
         self._icon_name = icon_name
         self._danger_hover = danger_hover
@@ -1612,82 +317,426 @@ class VectorIconButton(QAbstractButton):
     def sizeHint(self) -> QSize:
         return QSize(self._dim, self._dim)
 
-    def set_icon_name(self, icon_name: str):
+    def set_icon_name(self, icon_name: str) -> None:
         self._icon_name = icon_name
         self.update()
 
-    def set_palette_theme(self, palette: ThemePalette):
+    def set_palette_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
         self.update()
 
-    def enterEvent(self, event):
+    def enterEvent(self, event) -> None:
         self._hovered = True
         self.update()
         super().enterEvent(event)
 
-    def leaveEvent(self, event):
+    def leaveEvent(self, event) -> None:
         self._hovered = False
         self.update()
         super().leaveEvent(event)
 
-    def paintEvent(self, _event):
+    def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        rect = QRectF(2, 2, self.width() - 4, self.height() - 4)
+        rect = QRectF(3.5, 3.5, self.width() - 7.0, self.height() - 7.0)
+        radius = rect.height() * 0.36
 
-        if self._hovered:
-            bg = (
-                QColor("#EF4444")
-                if self._danger_hover
-                else (QColor(255, 208, 0, 32) if self._palette.is_dark else QColor(15, 23, 42, 16))
-            )
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(bg)
-            painter.drawRoundedRect(rect, 9, 9)
+        tint = QColor("#EF4444") if (self._hovered and self._danger_hover) else (
+            QColor(self._palette.accent_primary) if self._hovered else None
+        )
+        if self.isDown():
+            draw_neu_inset(painter, rect, radius, self._palette, depth=3.2, glow_tint=tint)
+        else:
+            draw_neu_raised(painter, rect, radius, self._palette, depth=3.2, hovered=self._hovered, accent_tint=tint)
 
         col = (
-            QColor("#FFFFFF")
+            QColor("#EF4444")
             if (self._hovered and self._danger_hover)
             else (
                 QColor(self._palette.accent_primary)
                 if (self._hovered and self._palette.is_dark)
-                else QColor(self._palette.text_secondary)
+                else (QColor("#B45309") if self._hovered else QColor(self._palette.text_secondary))
             )
         )
-        pad = self.width() * 0.24
-        icon_rect = QRectF(pad, pad, self.width() - 2 * pad, self.height() - 2 * pad)
+        shift = 0.8 if self.isDown() else 0.0
+        pad = self.width() * 0.27
+        icon_rect = QRectF(pad + shift, pad + shift, self.width() - 2.0 * pad, self.height() - 2.0 * pad)
         VectorIconPainter.draw_icon(painter, self._icon_name, icon_rect, col, stroke=1.75)
 
 
-class SegmentedCapsuleBar(QFrame):
+class ActionPillButton(QPushButton):
+    def __init__(self, icon_name: str, text: str = "", variant: str = "gold", parent=None):
+        super().__init__(text, parent)
+        self._icon_name = icon_name
+        self._variant = variant
+        self._hovered = False
+        self._palette: ThemePalette = DARK_PALETTE
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(38)
+        self.setMaximumHeight(40)
+        self._recalc_width()
+
+    def set_label_text(self, text: str) -> None:
+        self.setText(text)
+        self._recalc_width()
+        self.update()
+
+    def _recalc_width(self) -> None:
+        self.setFont(make_ui_font(9, QFont.Weight.Bold))
+        fm = QFontMetrics(self.font())
+        self.setMinimumWidth(fm.horizontalAdvance(self.text()) + 54)
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self._recalc_width()
+        self.update()
+
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = QRectF(3.5, 3.5, self.width() - 7.0, self.height() - 7.0)
+        radius = 12.0
+        pressed = self.isDown()
+
+        if not self.isEnabled():
+            draw_neu_inset(painter, rect, radius, self._palette, depth=2.5)
+            fg = QColor(self._palette.text_muted)
+        elif self._variant == "gold":
+            draw_neu_raised(painter, rect, radius, self._palette, depth=2.0 if pressed else 3.8)
+            grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
+            if pressed:
+                grad.setColorAt(0.0, QColor("#EAB308"))
+                grad.setColorAt(1.0, QColor("#CA8A04"))
+            else:
+                grad.setColorAt(0.0, QColor("#FFE866") if self._hovered else QColor("#FFD60A"))
+                grad.setColorAt(1.0, QColor("#F59E0B"))
+            painter.setPen(QPen(QColor(255, 255, 255, 110 if not pressed else 45), 1.1))
+            painter.setBrush(grad)
+            painter.drawRoundedRect(rect, radius, radius)
+            fg = QColor("#10151F")
+        elif self._variant == "emerald":
+            em = QColor(self._palette.emerald)
+            if pressed:
+                draw_neu_inset(painter, rect, radius, self._palette, depth=3.2, glow_tint=em)
+            else:
+                draw_neu_raised(painter, rect, radius, self._palette, depth=3.6, hovered=self._hovered, accent_tint=em)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor(em.red(), em.green(), em.blue(), 125 if self._hovered else 72), 1.1))
+                painter.drawRoundedRect(rect, radius, radius)
+            fg = em
+        else:
+            acc = QColor(self._palette.accent_primary) if self._hovered else None
+            if pressed:
+                draw_neu_inset(painter, rect, radius, self._palette, depth=3.2)
+            else:
+                draw_neu_raised(painter, rect, radius, self._palette, depth=3.6, hovered=self._hovered, accent_tint=acc)
+            fg = QColor(self._palette.text_primary) if self._hovered else QColor(self._palette.text_secondary)
+
+        shift = 0.8 if (pressed and self.isEnabled()) else 0.0
+        rtl = I18N.is_rtl()
+        if rtl:
+            icon_rect = QRectF(rect.right() - 25.0 + shift, rect.center().y() - 8.0 + shift, 16.0, 16.0)
+            txt_rect = QRectF(rect.left() + 8.0 + shift, rect.top() + shift, rect.width() - 36.0, rect.height())
+        else:
+            icon_rect = QRectF(rect.left() + 10.0 + shift, rect.center().y() - 8.0 + shift, 16.0, 16.0)
+            txt_rect = QRectF(rect.left() + 28.0 + shift, rect.top() + shift, rect.width() - 36.0, rect.height())
+
+        VectorIconPainter.draw_icon(painter, self._icon_name, icon_rect, fg, stroke=1.7)
+        painter.setPen(fg)
+        painter.setFont(self.font())
+        painter.drawText(txt_rect, Qt.AlignmentFlag.AlignCenter, self.text())
+
+
+class NavRailButton(QAbstractButton):
+    def __init__(self, icon_name: str, i18n_key: str, parent=None):
+        super().__init__(parent)
+        self._icon_name = icon_name
+        self._i18n_key = i18n_key
+        self._badge_count = 0
+        self._palette: ThemePalette = DARK_PALETTE
+        self._hovered = False
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        lock_widget_dimensions(self, 82, 66)
+
+    def sizeHint(self) -> QSize:
+        return QSize(82, 66)
+
+    def set_badge_count(self, count: int) -> None:
+        val = max(0, int(count))
+        if val != self._badge_count:
+            self._badge_count = val
+            self.update()
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self.update()
+
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = QRectF(6.0, 4.5, self.width() - 12.0, self.height() - 9.0)
+
+        active = self.isChecked()
+        accent = QColor(self._palette.accent_primary)
+
+        if active:
+            draw_neu_inset(painter, rect, 15.0, self._palette, depth=4.2, glow_tint=accent)
+            pill_x = (rect.right() - 4.2) if I18N.is_rtl() else (rect.left() + 1.4)
+            pill = QRectF(pill_x, rect.top() + 13.0, 3.0, rect.height() - 26.0)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(accent)
+            painter.drawRoundedRect(pill, 1.5, 1.5)
+        elif self._hovered:
+            draw_neu_raised(painter, rect, 15.0, self._palette, depth=3.4, hovered=True)
+
+        icon_col = (
+            accent
+            if (active and self._palette.is_dark)
+            else (QColor("#A16207") if active else QColor(self._palette.text_muted))
+        )
+        if self._hovered and (not active):
+            icon_col = QColor(self._palette.text_primary)
+
+        icon_rect = QRectF((self.width() - 22.0) / 2.0, 10.0, 22.0, 22.0)
+        VectorIconPainter.draw_icon(painter, self._icon_name, icon_rect, icon_col, stroke=1.85)
+
+        if self._badge_count > 0:
+            b_txt = str(self._badge_count) if self._badge_count < 100 else "99+"
+            painter.setFont(make_mono_font(7, bold=True))
+            bw = max(16.0, QFontMetrics(painter.font()).horizontalAdvance(b_txt) + 8.0)
+            b_rect = QRectF(self.width() / 2.0 + 3.0, 6.5, bw, 14.0)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(accent)
+            painter.drawRoundedRect(b_rect, 7.0, 7.0)
+            painter.setPen(QColor("#10151F"))
+            painter.drawText(b_rect, Qt.AlignmentFlag.AlignCenter, b_txt)
+
+        painter.setPen(icon_col)
+        painter.setFont(make_ui_font(8, QFont.Weight.ExtraBold if active else QFont.Weight.DemiBold))
+        painter.drawText(
+            QRectF(4.0, 35.0, self.width() - 8.0, 23.0),
+            Qt.AlignmentFlag.AlignCenter,
+            I18N.t(self._i18n_key),
+        )
+
+
+class AnimatedToggleSwitch(QAbstractButton):
+    def __init__(self, checked: bool = False, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setChecked(bool(checked))
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        lock_widget_dimensions(self, 50, 28)
+        self._palette: ThemePalette = DARK_PALETTE
+        self._offset = 1.0 if checked else 0.0
+
+        self._anim = QPropertyAnimation(self, b"knobOffset", self)
+        self._anim.setDuration(200)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.toggled.connect(self._animate_state)
+
+    def get_knob_offset(self) -> float:
+        return self._offset
+
+    def set_knob_offset(self, val: float) -> None:
+        self._offset = float(val)
+        self.update()
+
+    knobOffset = Property(float, get_knob_offset, set_knob_offset)
+
+    def set_checked_silent(self, checked: bool) -> None:
+        state = bool(checked)
+        self.blockSignals(True)
+        self._anim.stop()
+        self.setChecked(state)
+        self._offset = 1.0 if state else 0.0
+        self.blockSignals(False)
+        self.update()
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self.update()
+
+    def _animate_state(self, checked: bool) -> None:
+        self._anim.stop()
+        self._anim.setStartValue(self._offset)
+        self._anim.setEndValue(1.0 if checked else 0.0)
+        self._anim.start()
+
+    def sizeHint(self) -> QSize:
+        return QSize(50, 28)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        track = QRectF(2.5, 3.0, self.width() - 5.0, self.height() - 6.0)
+        radius = track.height() / 2.0
+        accent = QColor(self._palette.accent_primary)
+
+        tint = QColor(accent.red(), accent.green(), accent.blue(), int(255 * self._offset)) if self._offset > 0.05 else None
+        draw_neu_inset(painter, track, radius, self._palette, depth=3.5, glow_tint=tint)
+
+        if self._offset > 0.05:
+            glow_fill = QColor(accent)
+            glow_fill.setAlpha(int((75 if self._palette.is_dark else 92) * self._offset))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(glow_fill)
+            painter.drawRoundedRect(track.adjusted(1.5, 1.5, -1.5, -1.5), radius - 1.5, radius - 1.5)
+
+        knob_d = track.height() - 4.0
+        min_x = track.left() + 2.0
+        max_x = track.right() - knob_d - 2.0
+        knob_x = min_x + (max_x - min_x) * self._offset
+        knob_rect = QRectF(knob_x, track.top() + 2.0, knob_d, knob_d)
+
+        shadow_c = parse_css_color(self._palette.neu_shadow_dark)
+        shadow_c.setAlpha(135)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(shadow_c)
+        painter.drawEllipse(knob_rect.translated(1.4, 1.6))
+
+        knob_grad = QLinearGradient(knob_rect.topLeft(), knob_rect.bottomRight())
+        if self._offset > 0.5:
+            knob_grad.setColorAt(0.0, QColor("#FFE866"))
+            knob_grad.setColorAt(1.0, QColor("#F59E0B"))
+            dot_col = QColor("#10151F")
+        else:
+            knob_grad.setColorAt(0.0, parse_css_color(self._palette.surface_hi).lighter(112))
+            knob_grad.setColorAt(1.0, parse_css_color(self._palette.surface_lo))
+            dot_col = QColor(self._palette.text_muted)
+
+        painter.setBrush(knob_grad)
+        painter.setPen(QPen(QColor(255, 255, 255, 110 if not self._palette.is_dark else 55), 1.0))
+        painter.drawEllipse(knob_rect)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(dot_col)
+        painter.drawEllipse(knob_rect.center(), 2.3, 2.3)
+
+
+class _NeuSegmentTabBtn(QPushButton):
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self._palette: ThemePalette = DARK_PALETTE
+        self._hovered = False
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(34)
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self.update()
+
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = QRectF(3.0, 2.5, self.width() - 6.0, self.height() - 5.0)
+        active = self.isChecked()
+        accent = QColor(self._palette.accent_primary)
+
+        if active:
+            draw_neu_raised(painter, rect, 10.0, self._palette, depth=3.2, accent_tint=accent)
+            bar_w = min(28.0, rect.width() * 0.35)
+            bar_rect = QRectF(rect.center().x() - bar_w / 2.0, rect.bottom() - 3.2, bar_w, 2.2)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(accent)
+            painter.drawRoundedRect(bar_rect, 1.1, 1.1)
+            fg = accent if self._palette.is_dark else QColor("#9A6700")
+            painter.setFont(make_ui_font(10, QFont.Weight.ExtraBold))
+        else:
+            if self._hovered:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(accent.red(), accent.green(), accent.blue(), 18))
+                painter.drawRoundedRect(rect, 10.0, 10.0)
+            fg = QColor(self._palette.text_primary) if self._hovered else QColor(self._palette.text_muted)
+            painter.setFont(make_ui_font(10, QFont.Weight.DemiBold))
+
+        painter.setPen(fg)
+        painter.drawText(rect.adjusted(4.0, 0.0, -4.0, -1.0), Qt.AlignmentFlag.AlignCenter, self.text())
+
+
+class SegmentedControl(QFrame):
     current_changed = Signal(int)
 
-    def __init__(self, labels: list[str], parent=None):
+    def __init__(self, labels: list[str] | None = None, parent=None):
         super().__init__(parent)
-        self.setObjectName("PillBar")
         self._palette: ThemePalette = DARK_PALETTE
-        self._buttons: list[QPushButton] = []
+        self._buttons: list[_NeuSegmentTabBtn] = []
         self._current_index = 0
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(6)
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(6, 5, 6, 5)
+        self._layout.setSpacing(4)
+
+        if labels:
+            self.set_items(labels)
+
+    def set_items(self, labels: list[str], keep_index: bool = True) -> None:
+        prev = self._current_index if keep_index else 0
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._buttons.clear()
 
         for idx, text in enumerate(labels):
-            btn = QPushButton(text)
-            btn.setCheckable(True)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setMinimumHeight(34)
+            btn = _NeuSegmentTabBtn(text, self)
+            btn.set_palette_theme(self._palette)
             btn.clicked.connect(lambda _chk=False, i=idx: self.set_current_index(i, emit_signal=True))
             self._buttons.append(btn)
-            layout.addWidget(btn, 1)
+            self._layout.addWidget(btn, 1)
 
-        self._refresh_button_styles()
+        if self._buttons:
+            self._current_index = max(0, min(prev, len(self._buttons) - 1))
+            self._buttons[self._current_index].setChecked(True)
+        else:
+            self._current_index = 0
+        self.update()
+
+    def update_labels(self, labels: list[str]) -> None:
+        if len(labels) != len(self._buttons):
+            self.set_items(labels, keep_index=True)
+            return
+        for btn, txt in zip(self._buttons, labels):
+            btn.setText(txt)
+            btn.update()
 
     def current_index(self) -> int:
         return self._current_index
 
-    def set_current_index(self, index: int, emit_signal: bool = False):
+    def set_current_index(self, index: int, emit_signal: bool = False) -> None:
         if not (0 <= index < len(self._buttons)):
             return
         self._current_index = index
@@ -1695,87 +744,1341 @@ class SegmentedCapsuleBar(QFrame):
             btn.blockSignals(True)
             btn.setChecked(i == index)
             btn.blockSignals(False)
-        self._refresh_button_styles()
+            btn.update()
         if emit_signal:
             self.current_changed.emit(index)
 
-    def set_palette_theme(self, palette: ThemePalette):
+    def set_palette_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
-        self._refresh_button_styles()
+        for btn in self._buttons:
+            btn.set_palette_theme(palette)
+        self.update()
 
-    def _refresh_button_styles(self):
-        p = self._palette
-        for i, btn in enumerate(self._buttons):
-            if i == self._current_index:
-                btn.setStyleSheet(
-                    f"QPushButton {{ background-color: {p.accent_primary}; color: {p.button_text_on_accent}; "
-                    f"border: none; border-radius: 10px; font-weight: 800; font-size: 11px; padding: 6px 12px; }}"
-                )
-            else:
-                btn.setStyleSheet(
-                    f"QPushButton {{ background-color: transparent; color: {p.text_secondary}; "
-                    f"border: none; border-radius: 10px; font-weight: 600; font-size: 11px; padding: 6px 12px; }}"
-                    f"QPushButton:hover {{ background-color: {p.accent_soft_bg}; color: {p.text_primary}; }}"
-                )
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        trough = QRectF(2.0, 2.0, self.width() - 4.0, self.height() - 4.0)
+        draw_neu_inset(painter, trough, 13.0, self._palette, depth=4.0)
 
 
-class CollapsibleAccordion(QFrame):
-    def __init__(self, title: str, subtitle: str = "", expanded: bool = False, parent=None):
+class GlobalTaskStrip(QFrame):
+    stop_requested = Signal()
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.setObjectName("GlassCard")
-        self._expanded = expanded
         self._palette: ThemePalette = DARK_PALETTE
+        self._active = False
+        self._angle = 0.0
+        self._target_h = 44
+        self.setMaximumHeight(0)
+        self.hide()
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        self._anim = QPropertyAnimation(self, b"maximumHeight", self)
+        self._anim.setDuration(220)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.finished.connect(self._on_anim_done)
 
-        self.header_btn = QWidget()
-        self.header_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        hdr_layout = QHBoxLayout(self.header_btn)
-        hdr_layout.setContentsMargins(18, 14, 18, 14)
-        hdr_layout.setSpacing(12)
+        self._spin_timer = QTimer(self)
+        self._spin_timer.setInterval(30)
+        self._spin_timer.timeout.connect(self._tick_spin)
 
-        txt_col = QVBoxLayout()
-        txt_col.setSpacing(2)
-        self.title_lbl = QLabel(title)
-        self.title_lbl.setFont(make_ui_font(11, QFont.Weight.Bold))
-        txt_col.addWidget(self.title_lbl)
-        if subtitle:
-            self.sub_lbl = QLabel(subtitle)
-            self.sub_lbl.setObjectName("MutedLabel")
-            txt_col.addWidget(self.sub_lbl)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.setInterval(380)
+        self._hide_timer.timeout.connect(self._collapse)
 
-        self.state_pill = QLabel("باز کردن" if not expanded else "بستن")
-        self.state_pill.setObjectName("BadgePill")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(20, 6, 20, 6)
+        row.setSpacing(12)
 
-        self.chevron = VectorIconButton("chevron_down" if expanded else "chevron_left", size=28)
-        self.chevron.clicked.connect(self.toggle)
+        self.spin_canvas = QWidget()
+        lock_widget_dimensions(self.spin_canvas, 18, 18)
+        self.spin_canvas.paintEvent = self._paint_spinner
 
-        hdr_layout.addLayout(txt_col, 1)
-        hdr_layout.addWidget(self.state_pill)
-        hdr_layout.addWidget(self.chevron)
-        self.header_btn.mouseReleaseEvent = lambda _e: self.toggle()
+        self.msg_lbl = QLabel("")
+        self.msg_lbl.setObjectName("SecondaryLabel")
 
-        self.body_container = QWidget()
-        self.body_container.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.body_layout = QVBoxLayout(self.body_container)
-        self.body_layout.setContentsMargins(18, 4, 18, 18)
-        self.body_layout.setSpacing(14)
-        self.body_container.setVisible(expanded)
+        self.bar = QProgressBar()
+        self.bar.setObjectName("GoldProgress")
+        self.bar.setRange(0, 100)
+        self.bar.setValue(0)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedWidth(210)
+        self.bar.setFixedHeight(9)
+        enforce_english_ltr(self.bar, mono_size=9)
 
-        outer.addWidget(self.header_btn)
-        outer.addWidget(self.body_container)
+        self.pct_lbl = QLabel("0%")
+        self.pct_lbl.setObjectName("BadgePill")
+        enforce_english_ltr(self.pct_lbl, mono_size=10, bold=True)
 
-    def toggle(self):
-        self.set_expanded(not self._expanded)
+        self.stop_btn = QPushButton(I18N.t("stop"))
+        self.stop_btn.setObjectName("DangerBtn")
+        self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.stop_btn.clicked.connect(self.stop_requested.emit)
 
-    def set_expanded(self, expanded: bool):
-        self._expanded = expanded
-        self.body_container.setVisible(expanded)
-        self.chevron.set_icon_name("chevron_down" if expanded else "chevron_left")
-        self.state_pill.setText("بستن" if expanded else "باز کردن")
+        row.addWidget(self.spin_canvas)
+        row.addWidget(self.msg_lbl, 1)
+        row.addWidget(self.bar)
+        row.addWidget(self.pct_lbl)
+        row.addWidget(self.stop_btn)
 
-    def set_palette_theme(self, palette: ThemePalette):
+    def paintEvent(self, _event) -> None:
+        if self.height() < 8:
+            return
+        painter = QPainter(self)
+        well = QRectF(12.0, 2.0, self.width() - 24.0, self.height() - 4.0)
+        draw_neu_inset(painter, well, 11.0, self._palette, depth=3.2)
+
+    def retranslate_ui(self) -> None:
+        self.stop_btn.setText(I18N.t("stop"))
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
-        self.chevron.set_palette_theme(palette)
+        self.spin_canvas.update()
+        self.update()
+
+    def _tick_spin(self) -> None:
+        self._angle = (self._angle + 12.0) % 360.0
+        self.spin_canvas.update()
+
+    def _paint_spinner(self, _event) -> None:
+        painter = QPainter(self.spin_canvas)
+        VectorIconPainter.draw_icon(
+            painter,
+            "spinner",
+            QRectF(1.0, 1.0, 16.0, 16.0),
+            QColor(self._palette.accent_primary),
+            stroke=1.8,
+            angle=self._angle,
+        )
+
+    def update_task_state(self, active: bool, percent: int, message: str) -> None:
+        pct = max(0, min(100, int(percent or 0)))
+        self.bar.setValue(pct)
+        self.pct_lbl.setText(f"{pct}%")
+        if message:
+            self.msg_lbl.setText(strip_emojis(message))
+
+        if active:
+            self._hide_timer.stop()
+            self._active = True
+            if not self._spin_timer.isActive():
+                self._spin_timer.start()
+            if (not self.isVisible()) or (self.maximumHeight() < self._target_h):
+                self.show()
+                self._anim.stop()
+                self._anim.setStartValue(self.maximumHeight())
+                self._anim.setEndValue(self._target_h)
+                self._anim.start()
+        else:
+            self._active = False
+            self._spin_timer.stop()
+            if self.isVisible():
+                self._hide_timer.start()
+
+    def _collapse(self) -> None:
+        if self._active:
+            return
+        self._anim.stop()
+        self._anim.setStartValue(self.maximumHeight())
+        self._anim.setEndValue(0)
+        self._anim.start()
+
+    def _on_anim_done(self) -> None:
+        if (not self._active) and (self.maximumHeight() == 0):
+            self.hide()
+
+
+class NeuHeroStageBackdrop(QWidget):
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAutoFillBackground(False)
+        self._palette: ThemePalette = DARK_PALETTE
+        self._phase = "IDLE"
+        self._country_code = ""
+
+        c1, c2, c3 = get_flag_neon_triad("GLOBAL")
+        self._cur_c1 = QColor(c1)
+        self._cur_c2 = QColor(c2)
+        self._cur_c3 = QColor(c3)
+        self._tgt_c1 = QColor(c1)
+        self._tgt_c2 = QColor(c2)
+        self._tgt_c3 = QColor(c3)
+        self._wave_t = 0.0
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self.update()
+
+    def set_stage_context(self, country_code: str, phase: str) -> None:
+        norm_c = str(country_code or "").strip().upper()
+        if norm_c == "UK":
+            norm_c = "GB"
+        self._country_code = norm_c
+        self._tgt_c1, self._tgt_c2, self._tgt_c3 = get_flag_neon_triad(norm_c or "GLOBAL")
+        self._phase = str(phase or "IDLE").upper()
+
+    def advance_frame(self) -> None:
+        mult = 2.0 if self._phase == "CONNECTING" else (1.35 if self._phase == "CONNECTED" else 0.65)
+        self._wave_t = (self._wave_t + 0.032 * mult) % (2.0 * math.pi * 20.0)
+        self._cur_c1 = _lerp_color(self._cur_c1, self._tgt_c1, 0.10)
+        self._cur_c2 = _lerp_color(self._cur_c2, self._tgt_c2, 0.10)
+        self._cur_c3 = _lerp_color(self._cur_c3, self._tgt_c3, 0.10)
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        w, h = float(self.width()), float(self.height())
+        if w < 100.0 or h < 100.0:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        pad = 9.0
+        card = QRectF(pad, pad, w - 2.0 * pad, h - 2.0 * pad)
+        radius = 24.0
+
+        ambient_tint = (
+            QColor("#10B981")
+            if self._phase == "CONNECTED"
+            else (QColor("#F97316") if self._phase == "CONNECTING" else self._cur_c1)
+        )
+        draw_neu_raised(painter, card, radius, self._palette, depth=7.0, accent_tint=ambient_tint)
+
+        clip = QPainterPath()
+        clip.addRoundedRect(card, radius, radius)
+        painter.save()
+        painter.setClipPath(clip)
+
+        dot_col = QColor(255, 255, 255, 11) if self._palette.is_dark else QColor(15, 23, 42, 11)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(dot_col)
+        for gx in range(int(card.left()) + 20, int(card.right()) - 14, 28):
+            for gy in range(int(card.top()) + 20, int(card.bottom()) - 14, 28):
+                painter.drawEllipse(QPointF(float(gx), float(gy)), 1.05, 1.05)
+
+        rtl = I18N.is_rtl()
+        dest_x = card.left() + card.width() * 0.24 if rtl else card.right() - card.width() * 0.24
+        aura = QRadialGradient(QPointF(dest_x, card.top() + card.height() * 0.42), card.width() * 0.45)
+        aura_c = QColor(self._cur_c1 if self._phase == "CONNECTED" else ambient_tint)
+        aura_c.setAlpha(38 if self._palette.is_dark else 26)
+        aura.setColorAt(0.0, aura_c)
+        aura.setColorAt(0.6, QColor(self._cur_c3.red(), self._cur_c3.green(), self._cur_c3.blue(), 14))
+        aura.setColorAt(1.0, QColor(aura_c.red(), aura_c.green(), aura_c.blue(), 0))
+        painter.setBrush(aura)
+        painter.drawRect(card)
+
+        if self._phase == "CONNECTED" and self._country_code:
+            painter.save()
+            wm_w, wm_h = 235.0, 148.0
+            wm_cx = card.left() + 175.0 if rtl else card.right() - 175.0
+            wm_cy = card.top() + card.height() * 0.39 + math.sin(self._wave_t * 0.6) * 4.0
+            painter.translate(wm_cx, wm_cy)
+            painter.rotate(-8.5 if rtl else 8.5)
+            VectorFlagRenderer.draw_flag(
+                painter,
+                self._country_code,
+                QRectF(-wm_w / 2.0, -wm_h / 2.0, wm_w, wm_h),
+                radius=16.0,
+                opacity=0.14 if self._palette.is_dark else 0.10,
+                with_border=False,
+            )
+            painter.restore()
+            painter.setClipPath(clip)
+
+        triad = (self._cur_c1, self._cur_c2, self._cur_c3)
+        for idx, w_col in enumerate(triad):
+            ribbon = QPainterPath()
+            base_y = card.bottom() - (26.0 + idx * 17.0)
+            ribbon.moveTo(card.left(), card.bottom())
+            ribbon.lineTo(card.left(), base_y)
+            segs = 20
+            for s in range(segs + 1):
+                sx = card.left() + (s / segs) * card.width()
+                sy = base_y + math.sin(s * 0.46 + self._wave_t * (0.8 + idx * 0.22) + idx * 1.3) * (10.0 + idx * 3.5)
+                ribbon.lineTo(sx, sy)
+            ribbon.lineTo(card.right(), card.bottom())
+            ribbon.closeSubpath()
+
+            fc = QColor(w_col)
+            fc.setAlpha(20 - idx * 4 if self._palette.is_dark else 16 - idx * 3)
+            ec = QColor(w_col)
+            ec.setAlpha(62 if self._phase == "CONNECTED" else 36)
+            painter.setBrush(fc)
+            painter.setPen(QPen(ec, 1.05))
+            painter.drawPath(ribbon)
+
+        painter.restore()
+
+
+class FlagOrbitalHudWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(256, 192)
+        self.setMaximumSize(292, 212)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+
+        self._palette: ThemePalette = DARK_PALETTE
+        self._country_code = ""
+        self._phase = "IDLE"
+        self._proto_text = "VLESS"
+        self._vec_text = "AUTO"
+        self._ping_ms = 0
+        self._wave_phase = 0.0
+        self._bars = [0.20] * 18
+
+        c1, c2, c3 = get_flag_neon_triad("GLOBAL")
+        self._c1 = QColor(c1)
+        self._c2 = QColor(c2)
+        self._c3 = QColor(c3)
+
+    def sizeHint(self) -> QSize:
+        return QSize(272, 198)
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self.update()
+
+    def update_hud_state(
+        self,
+        country_code: str,
+        phase: str,
+        proto: str,
+        vector_id: str,
+        ping_ms: int,
+        activity_boost: float = 0.0,
+    ) -> None:
+        norm = str(country_code or "").strip().upper()
+        if norm == "UK":
+            norm = "GB"
+        self._country_code = norm
+        self._phase = str(phase or "IDLE").upper()
+        self._proto_text = str(proto or "VLESS").upper()[:10]
+        self._vec_text = str(vector_id or "AUTO").upper()[:10]
+        self._ping_ms = int(ping_ms or 0)
+
+        t1, t2, t3 = get_flag_neon_triad(norm or "GLOBAL")
+        self._c1 = _lerp_color(self._c1, t1, 0.15)
+        self._c2 = _lerp_color(self._c2, t2, 0.15)
+        self._c3 = _lerp_color(self._c3, t3, 0.15)
+
+        spd = 0.22 if self._phase == "CONNECTING" else (0.15 if self._phase == "CONNECTED" else 0.05)
+        self._wave_phase = (self._wave_phase + spd) % (2.0 * math.pi * 10.0)
+
+        amp_base = (
+            min(1.0, 0.48 + activity_boost * 0.45)
+            if self._phase == "CONNECTED"
+            else (0.70 if self._phase == "CONNECTING" else 0.22)
+        )
+        for i in range(len(self._bars)):
+            w1 = 0.5 + 0.5 * math.sin(self._wave_phase * 1.3 + i * 0.48)
+            w2 = 0.5 + 0.5 * math.cos(self._wave_phase * 0.85 - i * 0.32)
+            target_h = 0.14 + amp_base * (0.58 * w1 + 0.42 * w2)
+            self._bars[i] = self._bars[i] * 0.70 + target_h * 0.30
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        w, h = float(self.width()), float(self.height())
+        card = QRectF(5.5, 5.5, w - 11.0, h - 11.0)
+        is_conn = self._phase == "CONNECTED"
+        spec = GeoFlagResolver.get_spec(self._country_code if is_conn else "")
+
+        draw_neu_raised(painter, card, 18.0, self._palette, depth=4.6, accent_tint=self._c1 if is_conn else None)
+
+        rtl = I18N.is_rtl()
+        fw, fh = 64.0, 42.0
+        fy = card.top() + 13.0
+        fx = (card.right() - 14.0 - fw) if rtl else (card.left() + 14.0)
+        flag_well = QRectF(fx - 3.0, fy - 3.0, fw + 6.0, fh + 6.0)
+        draw_neu_inset(painter, flag_well, 9.0, self._palette, depth=2.8)
+        VectorFlagRenderer.draw_flag(painter, spec.code, QRectF(fx, fy, fw, fh), radius=6.0, with_border=False)
+
+        if rtl:
+            txt_x = card.left() + 14.0
+            txt_w = flag_well.left() - txt_x - 10.0
+            align_flag = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        else:
+            txt_x = flag_well.right() + 10.0
+            txt_w = card.right() - 14.0 - txt_x
+            align_flag = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+
+        painter.setFont(make_ui_font(8, QFont.Weight.Bold))
+        painter.setPen(QColor(self._palette.text_muted))
+        painter.drawText(QRectF(txt_x, fy - 1.0, txt_w, 15.0), align_flag, I18N.t("hud_node_target"))
+
+        painter.setFont(make_ui_font(12, QFont.Weight.ExtraBold))
+        painter.setPen(QColor(self._palette.text_primary))
+        painter.drawText(QRectF(txt_x, fy + 14.0, txt_w, 20.0), align_flag, spec.localized_name())
+
+        status_tag = (
+            f"ONLINE // {spec.code}"
+            if (is_conn and spec.code)
+            else ("PROBING..." if self._phase == "CONNECTING" else "STANDBY")
+        )
+        painter.setFont(make_mono_font(8, bold=True))
+        painter.setPen(QColor(self._palette.emerald) if is_conn else self._c1)
+        painter.drawText(QRectF(txt_x, fy + 33.0, txt_w, 14.0), align_flag, status_tag)
+
+        spec_lbl_y = fy + fh + 11.0
+        painter.setFont(make_mono_font(7, bold=True))
+        painter.setPen(QColor(self._palette.text_muted))
+        painter.drawText(
+            QRectF(card.left() + 14.0, spec_lbl_y, card.width() - 28.0, 12.0),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            I18N.t("hud_live_spectrum"),
+        )
+
+        eq_well = QRectF(card.left() + 12.0, spec_lbl_y + 14.0, card.width() - 24.0, 44.0)
+        draw_neu_inset(painter, eq_well, 10.0, self._palette, depth=3.2)
+
+        eq_left = eq_well.left() + 7.0
+        eq_top = eq_well.top() + 6.0
+        eq_h = eq_well.height() - 12.0
+        eq_w = eq_well.width() - 14.0
+        n_bars = len(self._bars)
+        gap = 3.5
+        bar_w = (eq_w - gap * (n_bars - 1)) / n_bars
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        for idx, norm_val in enumerate(self._bars):
+            bh = max(4.0, eq_h * min(1.0, norm_val))
+            bx = eq_left + idx * (bar_w + gap)
+            by = eq_top + (eq_h - bh)
+            b_col = _lerp_color(self._c1, self._c3, idx / max(1, n_bars - 1))
+            b_col.setAlpha(125 if self._phase == "IDLE" else 235)
+            painter.setBrush(b_col)
+            painter.drawRoundedRect(QRectF(bx, by, bar_w, bh), 2.0, 2.0)
+
+        pills_y = card.bottom() - 32.0
+        pills_h = 21.0
+        pw = (eq_well.width() - 12.0) / 3.0
+        ping_label = f"{self._ping_ms} ms" if (is_conn and self._ping_ms > 0) else (spec.code or "---")
+        items = [
+            (self._proto_text, self._c1),
+            (self._vec_text, QColor(self._palette.accent_primary)),
+            (ping_label, QColor(self._palette.emerald) if is_conn else QColor(self._palette.text_muted)),
+        ]
+        painter.setFont(make_mono_font(8, bold=True))
+        for p_idx, (p_txt, p_col) in enumerate(items):
+            px = eq_well.left() + p_idx * (pw + 6.0)
+            p_rect = QRectF(px, pills_y, pw, pills_h)
+            draw_neu_inset(painter, p_rect, 7.0, self._palette, depth=2.2)
+            painter.setPen(p_col if self._palette.is_dark else QColor("#1E293B"))
+            painter.drawText(p_rect, Qt.AlignmentFlag.AlignCenter, p_txt)
+
+
+class _HeroResizeFilter(QObject):
+    def __init__(self, hero: QWidget, backdrop: NeuHeroStageBackdrop):
+        super().__init__(hero)
+        self._hero = hero
+        self._backdrop = backdrop
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self._hero and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            self._backdrop.setGeometry(self._hero.rect())
+            self._backdrop.lower()
+        return False
+
+
+class AnimatedRadarCore(QWidget):
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(208, 208)
+        self.setMaximumSize(232, 232)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self._palette: ThemePalette = DARK_PALETTE
+        self._phase = "IDLE"
+        self._country_code = ""
+        self._effective_code = ""
+
+        c1, c2, c3 = get_flag_neon_triad("GLOBAL")
+        self._flag_c1 = QColor(c1)
+        self._flag_c2 = QColor(c2)
+        self._flag_c3 = QColor(c3)
+        self._tgt_c1 = QColor(c1)
+        self._tgt_c2 = QColor(c2)
+        self._tgt_c3 = QColor(c3)
+
+        self._angle = 0.0
+        self._pulse = 0.0
+        self._glow = 0.34
+
+        self._backdrop: NeuHeroStageBackdrop | None = None
+        self._hud_panel: FlagOrbitalHudWidget | None = None
+        self._resize_filter: _HeroResizeFilter | None = None
+
+        self._glow_anim = QPropertyAnimation(self, b"glowLevel", self)
+        self._glow_anim.setDuration(360)
+        self._glow_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(30)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+        I18N.language_changed.connect(self._on_lang_switched)
+        QTimer.singleShot(0, self._ensure_hero_stage_attached)
+
+    def sizeHint(self) -> QSize:
+        return QSize(216, 216)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._ensure_hero_stage_attached()
+
+    def _on_lang_switched(self, _lang: str) -> None:
+        hero = self.parentWidget()
+        home = hero.parentWidget() if hero is not None else None
+        if home is not None and hasattr(home, "headline_lbl"):
+            home.headline_lbl.setFont(make_ui_font(22, QFont.Weight.ExtraBold))
+            if hasattr(home, "detail_lbl"):
+                home.detail_lbl.setFont(make_ui_font(10, QFont.Weight.DemiBold))
+        if self._backdrop is not None:
+            self._backdrop.update()
+        if self._hud_panel is not None:
+            self._hud_panel.update()
+        self.update()
+
+    def _ensure_hero_stage_attached(self) -> None:
+        hero = self.parentWidget()
+        if not isinstance(hero, QFrame) or hero.objectName() != "HeroCard":
+            return
+        if getattr(hero, "_alan_neu_stage_ready", False):
+            return
+        setattr(hero, "_alan_neu_stage_ready", True)
+
+        self._backdrop = NeuHeroStageBackdrop(hero)
+        self._backdrop.set_palette_theme(self._palette)
+        self._backdrop.setGeometry(hero.rect())
+        self._backdrop.lower()
+        self._backdrop.show()
+
+        self._resize_filter = _HeroResizeFilter(hero, self._backdrop)
+        hero.installEventFilter(self._resize_filter)
+
+        hero_vbox = hero.layout()
+        if hero_vbox is not None and hero_vbox.count() >= 1:
+            top_item = hero_vbox.itemAt(0)
+            center_row = top_item.layout() if top_item is not None else None
+            if center_row is not None:
+                self._hud_panel = FlagOrbitalHudWidget(hero)
+                self._hud_panel.set_palette_theme(self._palette)
+                center_row.addWidget(self._hud_panel, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        home = hero.parentWidget()
+        if home is not None:
+            if hasattr(home, "headline_lbl"):
+                home.headline_lbl.setFont(make_ui_font(22, QFont.Weight.ExtraBold))
+            if hasattr(home, "detail_lbl"):
+                home.detail_lbl.setFont(make_ui_font(10, QFont.Weight.DemiBold))
+
+        self._sync_stage_companions()
+
+    def _resolve_live_meta(self) -> tuple[str, str, str, int, float]:
+        code = self._country_code if self._phase == "CONNECTED" else ""
+        proto = "VLESS"
+        vec = "AUTO"
+        ping = 0
+        boost = 0.0
+
+        hero = self.parentWidget()
+        home = hero.parentWidget() if hero is not None else None
+
+        if home is not None:
+            snap = getattr(home, "_last_snap", None)
+            if isinstance(snap, dict) and snap:
+                vec = str(snap.get("active_vector_id") or vec)
+                ping = int(snap.get("ping_ms") or 0)
+                rx = float(snap.get("rx_rate_kbps") or 0.0)
+                tx = float(snap.get("tx_rate_kbps") or 0.0)
+                if rx > 0.0 or tx > 0.0:
+                    boost = min(1.0, math.log10(1.0 + rx + tx) / 3.6)
+
+            cur_fn = getattr(home, "_resolve_current_output_dict", None)
+            if callable(cur_fn):
+                cur_out = cur_fn()
+                if isinstance(cur_out, dict) and cur_out:
+                    proto = str(cur_out.get("protocol") or proto).upper()
+                    if vec == "AUTO":
+                        vec = str(cur_out.get("vector_id") or cur_out.get("cached_vector_id") or vec)
+
+        return code, proto, vec, ping, boost
+
+    def _sync_stage_companions(self) -> None:
+        eff_code, proto, vec, ping, boost = self._resolve_live_meta()
+        self._effective_code = eff_code
+        self._tgt_c1, self._tgt_c2, self._tgt_c3 = get_flag_neon_triad(eff_code or "GLOBAL")
+
+        if self._backdrop is not None:
+            self._backdrop.set_stage_context(eff_code, self._phase)
+            self._backdrop.advance_frame()
+
+        if self._hud_panel is not None:
+            self._hud_panel.update_hud_state(eff_code, self._phase, proto, vec, ping, boost)
+
+        hero = self.parentWidget()
+        home = hero.parentWidget() if hero is not None else None
+        if home is not None:
+            btn = getattr(home, "connect_btn", None)
+            if isinstance(btn, KineticConnectButton):
+                btn.set_flag_accent(self._flag_c1)
+
+    def get_glow_level(self) -> float:
+        return self._glow
+
+    def set_glow_level(self, val: float) -> None:
+        self._glow = float(val)
+        self.update()
+
+    glowLevel = Property(float, get_glow_level, set_glow_level)
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        if self._backdrop is not None:
+            self._backdrop.set_palette_theme(palette)
+        if self._hud_panel is not None:
+            self._hud_panel.set_palette_theme(palette)
+        hero = self.parentWidget()
+        home = hero.parentWidget() if hero is not None else None
+        if home is not None and hasattr(home, "headline_lbl"):
+            home.headline_lbl.setFont(make_ui_font(22, QFont.Weight.ExtraBold))
+        self.update()
+
+    def set_country_code(self, code: str) -> None:
+        spec = GeoFlagResolver.get_spec(code)
+        self._country_code = spec.code
+        self._sync_stage_companions()
+        self.update()
+
+    def set_ui_phase(self, phase: str) -> None:
+        norm = str(phase or "IDLE").upper()
+        if norm not in ("IDLE", "CONNECTING", "CONNECTED", "ERROR"):
+            norm = "IDLE"
+        if norm == self._phase:
+            return
+        self._phase = norm
+        target = 0.98 if norm == "CONNECTED" else (0.88 if norm == "CONNECTING" else 0.36)
+        self._glow_anim.stop()
+        self._glow_anim.setStartValue(self._glow)
+        self._glow_anim.setEndValue(target)
+        self._glow_anim.start()
+        self._sync_stage_companions()
+
+    def _tick(self) -> None:
+        if self._phase == "CONNECTING":
+            self._angle = (self._angle + 6.2) % 360.0
+            self._pulse = (self._pulse + 0.13) % (2.0 * math.pi)
+        elif self._phase == "CONNECTED":
+            self._angle = (self._angle + 1.45) % 360.0
+            self._pulse = (self._pulse + 0.055) % (2.0 * math.pi)
+        else:
+            self._angle = (self._angle + 0.50) % 360.0
+            self._pulse = (self._pulse + 0.032) % (2.0 * math.pi)
+
+        self._flag_c1 = _lerp_color(self._flag_c1, self._tgt_c1, 0.12)
+        self._flag_c2 = _lerp_color(self._flag_c2, self._tgt_c2, 0.12)
+        self._flag_c3 = _lerp_color(self._flag_c3, self._tgt_c3, 0.12)
+
+        self._sync_stage_companions()
+        self.update()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        cx, cy = self.width() / 2.0, self.height() / 2.0
+        max_r = min(cx, cy) - 9.0
+        breath = 0.5 + 0.5 * math.sin(self._pulse)
+
+        emerald = QColor("#10B981")
+        orange = QColor("#F97316")
+        crimson = QColor("#EF4444")
+
+        if self._phase == "CONNECTED":
+            core_col = emerald
+            orbit_col = self._flag_c1
+        elif self._phase == "CONNECTING":
+            core_col = orange
+            orbit_col = self._flag_c1
+        elif self._phase == "ERROR":
+            core_col = crimson
+            orbit_col = self._flag_c1
+        else:
+            core_col = QColor(self._palette.accent_primary)
+            orbit_col = self._flag_c2
+
+        outer_dial = QRectF(cx - max_r, cy - max_r, max_r * 2.0, max_r * 2.0)
+        draw_neu_raised(painter, outer_dial, max_r, self._palette, depth=6.0, accent_tint=core_col)
+
+        well_r = max_r * 0.86
+        well_rect = QRectF(cx - well_r, cy - well_r, well_r * 2.0, well_r * 2.0)
+        draw_neu_inset(painter, well_rect, well_r, self._palette, depth=5.0, glow_tint=core_col)
+
+        ticks = 42
+        t_in = well_r * 0.88
+        t_out = well_r * 0.96
+        head = int((self._angle / 360.0) * ticks)
+        triad = (self._flag_c1, self._flag_c2, self._flag_c3)
+        for i in range(ticks):
+            rad = math.radians(i * (360.0 / ticks))
+            dist = (i - head) % ticks
+            lit = dist < 10
+            tc = QColor(triad[i % 3] if lit else core_col)
+            tc.setAlpha(220 if lit else (65 if self._palette.is_dark else 95))
+            painter.setPen(QPen(tc, 2.0 if lit else 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.drawLine(
+                QPointF(cx + math.cos(rad) * t_in, cy + math.sin(rad) * t_in),
+                QPointF(cx + math.cos(rad) * t_out, cy + math.sin(rad) * t_out),
+            )
+
+        painter.save()
+        painter.translate(cx, cy)
+        painter.rotate(-self._angle * 1.35)
+        r_mid = well_r * 0.72
+        sweep = QConicalGradient(QPointF(0.0, 0.0), 0.0)
+        sweep_a = 145 if self._phase == "CONNECTING" else (95 if self._phase == "CONNECTED" else 55)
+        sweep.setColorAt(0.0, QColor(core_col.red(), core_col.green(), core_col.blue(), sweep_a))
+        sweep.setColorAt(0.32, QColor(core_col.red(), core_col.green(), core_col.blue(), 0))
+        sweep.setColorAt(1.0, QColor(core_col.red(), core_col.green(), core_col.blue(), 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(sweep)
+        painter.drawEllipse(QPointF(0.0, 0.0), r_mid, r_mid)
+
+        arc_rect = QRectF(-r_mid, -r_mid, r_mid * 2.0, r_mid * 2.0)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(core_col, 2.3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawArc(arc_rect, 16 * 16, 112 * 16)
+        painter.setPen(QPen(orbit_col, 2.3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawArc(arc_rect, 196 * 16, 112 * 16)
+        painter.restore()
+
+        r_core = max_r * 0.45
+        knob_rect = QRectF(cx - r_core, cy - r_core, r_core * 2.0, r_core * 2.0)
+        draw_neu_raised(painter, knob_rect, r_core, self._palette, depth=4.5, accent_tint=core_col)
+
+        ring_col = QColor(core_col)
+        ring_col.setAlpha(int(135 + 85 * breath))
+        painter.setPen(QPen(ring_col, 2.2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPointF(cx, cy), r_core - 2.0, r_core - 2.0)
+
+        lock_icon = "lock_closed" if self._phase == "CONNECTED" else "lock_open"
+        lock_col = core_col if (not self._palette.is_dark or self._phase != "CONNECTED") else QColor("#F8FAFC")
+        VectorIconPainter.draw_icon(
+            painter,
+            lock_icon,
+            QRectF(cx - 17.0, cy - 26.0, 34.0, 34.0),
+            lock_col,
+            stroke=2.2,
+        )
+
+        flag_rect = QRectF(cx - 16.0, cy + 10.0, 32.0, 20.0)
+        VectorFlagRenderer.draw_flag(painter, self._effective_code, flag_rect, radius=4.5, with_border=True)
+
+
+class KineticConnectButton(QPushButton):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(58)
+        self.setMaximumHeight(62)
+        self.setMinimumWidth(265)
+
+        self._palette: ThemePalette = DARK_PALETTE
+        self._phase = "IDLE"
+        self._custom_label = ""
+        self._flag_accent = QColor("#FFD000")
+        self._hover = 0.0
+        self._shimmer = -0.35
+        self._spin_angle = 0.0
+        self._pulse = 0.0
+
+        self._hover_anim = QPropertyAnimation(self, b"hoverVal", self)
+        self._hover_anim.setDuration(220)
+        self._hover_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        self._shimmer_anim = QPropertyAnimation(self, b"shimmerVal", self)
+        self._shimmer_anim.setDuration(880)
+        self._shimmer_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(28)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+        self.set_phase_and_label("IDLE", "")
+
+    def set_flag_accent(self, col: QColor) -> None:
+        self._flag_accent = QColor(col)
+        self.update()
+
+    def get_hover_val(self) -> float:
+        return self._hover
+
+    def set_hover_val(self, v: float) -> None:
+        self._hover = float(v)
+        self.update()
+
+    hoverVal = Property(float, get_hover_val, set_hover_val)
+
+    def get_shimmer_val(self) -> float:
+        return self._shimmer
+
+    def set_shimmer_val(self, v: float) -> None:
+        self._shimmer = float(v)
+        self.update()
+
+    shimmerVal = Property(float, get_shimmer_val, set_shimmer_val)
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self.setFont(make_ui_font(11, QFont.Weight.ExtraBold))
+        self.update()
+
+    def retranslate_ui(self) -> None:
+        self.setFont(make_ui_font(11, QFont.Weight.ExtraBold))
+        self._refresh_caption()
+        self.update()
+
+    def _tick(self) -> None:
+        if self._phase == "CONNECTING":
+            self._spin_angle = (self._spin_angle + 11.0) % 360.0
+            self._pulse = (self._pulse + 0.15) % (2.0 * math.pi)
+            self.update()
+        elif self._hover > 0.01:
+            self._pulse = (self._pulse + 0.05) % (2.0 * math.pi)
+            self.update()
+
+    def set_phase_and_label(self, phase: str, custom_label: str = "") -> None:
+        norm = str(phase or "IDLE").upper()
+        if norm not in ("IDLE", "CONNECTING", "CONNECTED", "ERROR"):
+            norm = "IDLE"
+        self._phase = norm
+        self._custom_label = strip_emojis(custom_label)
+        self.setFont(make_ui_font(11, QFont.Weight.ExtraBold))
+        self._refresh_caption()
+        self.update()
+
+    def _refresh_caption(self) -> None:
+        if self._custom_label and I18N.lang == "fa":
+            self.setText(self._custom_label)
+            return
+        if self._phase == "CONNECTING":
+            self.setText(I18N.t("btn_cancel_connect"))
+        elif self._phase == "CONNECTED":
+            self.setText(I18N.t("btn_disconnect"))
+        else:
+            self.setText(I18N.t("btn_connect"))
+
+    def enterEvent(self, event) -> None:
+        self._hover_anim.stop()
+        self._hover_anim.setStartValue(self._hover)
+        self._hover_anim.setEndValue(1.0)
+        self._hover_anim.start()
+
+        self._shimmer_anim.stop()
+        self._shimmer_anim.setStartValue(-0.35)
+        self._shimmer_anim.setEndValue(1.35)
+        self._shimmer_anim.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover_anim.stop()
+        self._hover_anim.setStartValue(self._hover)
+        self._hover_anim.setEndValue(0.0)
+        self._hover_anim.start()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        shell_rect = QRectF(5.0, 5.0, self.width() - 10.0, self.height() - 10.0)
+        shell_r = shell_rect.height() / 2.0
+        draw_neu_raised(painter, shell_rect, shell_r, self._palette, depth=2.6 if self.isDown() else 5.0)
+
+        core_rect = shell_rect.adjusted(4.0, 4.0, -4.0, -4.0)
+        core_r = core_rect.height() / 2.0
+        breath = 0.5 + 0.5 * math.sin(self._pulse)
+
+        if self._phase == "CONNECTING":
+            grad = QLinearGradient(core_rect.topLeft(), core_rect.bottomRight())
+            grad.setColorAt(0.0, QColor("#FB923C") if self._hover > 0.5 else QColor("#F97316"))
+            grad.setColorAt(1.0, QColor("#DC2626") if self._hover > 0.5 else QColor("#EF4444"))
+            rim_col = QColor(255, 237, 160, int(145 + 95 * breath))
+            fg_col = QColor("#FFFFFF")
+            icon_name = "spinner"
+        elif self._phase == "CONNECTED":
+            grad = QLinearGradient(core_rect.topLeft(), core_rect.bottomRight())
+            grad.setColorAt(0.0, QColor("#10B981"))
+            grad.setColorAt(0.65, QColor("#059669"))
+            grad.setColorAt(1.0, QColor("#047857"))
+            rim_col = _lerp_color(QColor("#6EE7B7"), self._flag_accent, 0.35)
+            fg_col = QColor("#FFFFFF")
+            icon_name = "shield_check"
+        else:
+            grad = QLinearGradient(core_rect.topLeft(), core_rect.bottomRight())
+            grad.setColorAt(0.0, QColor("#FFE866") if self._hover > 0.3 else QColor("#FFD60A"))
+            grad.setColorAt(0.55, QColor("#FFC300"))
+            grad.setColorAt(1.0, QColor("#F59E0B"))
+            rim_col = QColor(255, 255, 255, int(135 + 80 * self._hover))
+            fg_col = QColor("#10151F")
+            icon_name = "power"
+
+        capsule = QPainterPath()
+        capsule.addRoundedRect(core_rect, core_r, core_r)
+        painter.setBrush(grad)
+        painter.setPen(QPen(rim_col, 1.4))
+        painter.drawPath(capsule)
+
+        if -0.30 < self._shimmer < 1.30:
+            painter.save()
+            painter.setClipPath(capsule)
+            bx = core_rect.left() + core_rect.width() * self._shimmer
+            bw = core_rect.width() * 0.25
+            s_grad = QLinearGradient(QPointF(bx - bw, core_rect.top()), QPointF(bx + bw, core_rect.bottom()))
+            s_grad.setColorAt(0.0, QColor(255, 255, 255, 0))
+            s_grad.setColorAt(0.5, QColor(255, 255, 255, 105 if self._phase != "CONNECTED" else 75))
+            s_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(s_grad)
+            painter.drawRect(core_rect)
+            painter.restore()
+
+        painter.setFont(self.font())
+        fm = QFontMetrics(self.font())
+        label = self.text()
+        tw = fm.horizontalAdvance(label)
+        icon_d = 18.0
+        gap = 9.0
+        total_w = tw + gap + icon_d
+        sx = core_rect.center().x() - total_w / 2.0
+        shift = 0.8 if self.isDown() else 0.0
+
+        if I18N.is_rtl():
+            icon_rect = QRectF(sx + tw + gap + shift, core_rect.center().y() - icon_d / 2.0 + shift, icon_d, icon_d)
+            txt_rect = QRectF(sx + shift, core_rect.top() + shift, tw + 4.0, core_rect.height())
+        else:
+            icon_rect = QRectF(sx + shift, core_rect.center().y() - icon_d / 2.0 + shift, icon_d, icon_d)
+            txt_rect = QRectF(sx + icon_d + gap + shift, core_rect.top() + shift, tw + 4.0, core_rect.height())
+
+        painter.setPen(fg_col)
+        painter.drawText(txt_rect, Qt.AlignmentFlag.AlignCenter, label)
+        VectorIconPainter.draw_icon(painter, icon_name, icon_rect, fg_col, stroke=2.0, angle=self._spin_angle)
+
+
+class TacticalChronometerWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(178, 50)
+        self.setMaximumHeight(54)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+        self._palette: ThemePalette = DARK_PALETTE
+        self._uptime_label = "00:00:00"
+        self._is_connected = False
+        self._pulse = 0.0
+        self._arc_angle = 0.0
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(45)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+    def sizeHint(self) -> QSize:
+        return QSize(182, 50)
+
+    def _tick(self) -> None:
+        if self._is_connected:
+            self._pulse = (self._pulse + 0.14) % (2.0 * math.pi)
+            self._arc_angle = (self._arc_angle + 5.5) % 360.0
+            self.update()
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self.update()
+
+    def set_uptime_state(self, uptime_label: str, is_connected: bool) -> None:
+        clean = str(uptime_label or "").strip()
+        self._uptime_label = clean if clean else "00:00:00"
+        self._is_connected = bool(is_connected)
+        self.update()
+
+    def _seconds_ratio(self) -> float:
+        parts = self._uptime_label.split(":")
+        if len(parts) == 3 and parts[2].isdigit():
+            return (int(parts[2]) % 60) / 59.0
+        return 0.0
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        rect = QRectF(3.0, 4.0, self.width() - 6.0, self.height() - 8.0)
+        tint = QColor("#10B981") if self._is_connected else None
+        draw_neu_inset(painter, rect, 14.0, self._palette, depth=4.0, glow_tint=tint)
+
+        led_center = QPointF(rect.left() + 19.0, rect.center().y())
+        if self._is_connected:
+            halo_a = int(50 + 80 * (0.5 + 0.5 * math.sin(self._pulse)))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(16, 185, 129, halo_a))
+            painter.drawEllipse(led_center, 7.5, 7.5)
+
+            painter.save()
+            painter.translate(led_center)
+            painter.rotate(self._arc_angle)
+            painter.setPen(QPen(QColor("#10B981"), 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawArc(QRectF(-7.5, -7.5, 15.0, 15.0), 0, 125 * 16)
+            painter.restore()
+            dot_col = QColor("#10B981")
+        else:
+            dot_col = QColor(self._palette.text_muted)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(dot_col)
+        painter.drawEllipse(led_center, 3.2, 3.2)
+
+        clock_rect = QRectF(rect.right() - 27.0, rect.center().y() - 8.5, 17.0, 17.0)
+        clock_col = QColor(self._palette.accent_primary) if self._is_connected else QColor(self._palette.text_muted)
+        VectorIconPainter.draw_icon(painter, "clock", clock_rect, clock_col, stroke=1.7)
+
+        txt_rect = QRectF(rect.left() + 31.0, rect.top() + 2.0, rect.width() - 62.0, rect.height() - 6.0)
+        painter.setFont(make_mono_font(12, bold=True))
+        painter.setPen(
+            QColor(self._palette.text_primary) if self._is_connected else QColor(self._palette.text_secondary)
+        )
+        painter.drawText(txt_rect, Qt.AlignmentFlag.AlignCenter, self._uptime_label)
+
+        if self._is_connected:
+            prog = self._seconds_ratio()
+            bar_left = rect.left() + 16.0
+            bar_max_w = rect.width() - 32.0
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(16, 185, 129, 45))
+            painter.drawRoundedRect(QRectF(bar_left, rect.bottom() - 4.0, bar_max_w, 2.2), 1.1, 1.1)
+            painter.setBrush(QColor("#10B981"))
+            painter.drawRoundedRect(QRectF(bar_left, rect.bottom() - 4.0, max(6.0, bar_max_w * prog), 2.2), 1.1, 1.1)
+
+
+SpoilerChronometer = TacticalChronometerWidget
+
+
+class RouteTopologyStrip(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(64)
+        self.setMaximumHeight(68)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._palette: ThemePalette = DARK_PALETTE
+        self._dest_code = ""
+        self._dest_label = "---"
+        self._ip_text = "---"
+        self._ping_ms = 0
+        self._phase = "IDLE"
+        self._gemini_ready = False
+        self._flow = 0.0
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(30)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self.update()
+
+    def set_route_state(
+        self,
+        dest_code: str,
+        ip_text: str,
+        ping_ms: int,
+        phase: str,
+        gemini_ready: bool = False,
+        dest_label: str = "",
+    ) -> None:
+        spec = GeoFlagResolver.get_spec(dest_code)
+        self._dest_code = spec.code
+        raw_ip = str(ip_text or "").strip()
+        self._ip_text = raw_ip if (raw_ip and raw_ip not in ("—", "---")) else "---"
+        self._ping_ms = int(ping_ms or 0)
+        self._phase = str(phase or "IDLE").upper()
+        self._gemini_ready = bool(gemini_ready)
+
+        clean_lbl = strip_emojis(str(dest_label or "").strip())
+        if clean_lbl and clean_lbl not in ("—", "---"):
+            self._dest_label = clean_lbl
+        elif spec.code:
+            self._dest_label = f"{spec.localized_name()} ({spec.code})"
+        else:
+            self._dest_label = "---"
+        self.update()
+
+    def _tick(self) -> None:
+        spd = 0.035 if self._phase == "CONNECTING" else (0.018 if self._phase == "CONNECTED" else 0.006)
+        self._flow = (self._flow + spd) % 1.0
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        w, h = float(self.width()), float(self.height())
+        if w < 220.0:
+            return
+
+        is_conn = self._phase == "CONNECTED"
+        active_code = self._dest_code if is_conn else ""
+        spec = GeoFlagResolver.get_spec(active_code)
+        dest_c1, _, dest_c3 = get_flag_neon_triad(spec.code or "GLOBAL")
+
+        card = QRectF(3.0, 3.0, w - 6.0, h - 6.0)
+        draw_neu_inset(painter, card, 16.0, self._palette, depth=4.0, glow_tint=dest_c1 if is_conn else None)
+
+        cy = card.center().y()
+        fw, fh = 40.0, 26.0
+        rtl = I18N.is_rtl()
+
+        dest_title_val = self._dest_label if (is_conn and self._dest_label != "---") else "---"
+        dest_sub_ip = self._ip_text if (is_conn and self._ip_text != "---") else "---"
+
+        if rtl:
+            orig_flag = QRectF(card.right() - 16.0 - fw, cy - fh / 2.0, fw, fh)
+            VectorFlagRenderer.draw_flag(painter, "IR", orig_flag, radius=5.0)
+            painter.setFont(make_ui_font(9, QFont.Weight.Bold))
+            painter.setPen(QColor(self._palette.text_primary))
+            orig_txt = QRectF(orig_flag.left() - 108.0, card.top() + 8.0, 100.0, 20.0)
+            painter.drawText(orig_txt, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, I18N.t("route_origin"))
+            painter.setFont(make_mono_font(8))
+            painter.setPen(QColor(self._palette.text_muted))
+            painter.drawText(QRectF(orig_flag.left() - 108.0, cy + 3.0, 100.0, 17.0), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "LOCAL NODE")
+
+            dest_flag = QRectF(card.left() + 16.0, cy - fh / 2.0, fw, fh)
+            if is_conn and spec.code:
+                painter.setPen(QPen(dest_c1, 1.5))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(dest_flag.adjusted(-2.5, -2.5, 2.5, 2.5), 6.5, 6.5)
+            VectorFlagRenderer.draw_flag(painter, spec.code, dest_flag, radius=5.0)
+            painter.setFont(make_ui_font(9, QFont.Weight.Bold))
+            painter.setPen(QColor(self._palette.text_primary))
+            dest_txt = QRectF(dest_flag.right() + 10.0, card.top() + 8.0, 175.0, 20.0)
+            painter.drawText(dest_txt, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, I18N.t("route_dest", country=dest_title_val))
+            painter.setFont(make_mono_font(8, bold=True))
+            painter.setPen(dest_c1 if (is_conn and self._palette.is_dark) else QColor(self._palette.text_secondary))
+            painter.drawText(QRectF(dest_flag.right() + 10.0, cy + 3.0, 175.0, 17.0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, dest_sub_ip)
+
+            track_start = orig_txt.left() - 12.0
+            track_end = dest_txt.right() + 12.0
+        else:
+            orig_flag = QRectF(card.left() + 16.0, cy - fh / 2.0, fw, fh)
+            VectorFlagRenderer.draw_flag(painter, "IR", orig_flag, radius=5.0)
+            painter.setFont(make_ui_font(9, QFont.Weight.Bold))
+            painter.setPen(QColor(self._palette.text_primary))
+            orig_txt = QRectF(orig_flag.right() + 10.0, card.top() + 8.0, 108.0, 20.0)
+            painter.drawText(orig_txt, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, I18N.t("route_origin"))
+            painter.setFont(make_mono_font(8))
+            painter.setPen(QColor(self._palette.text_muted))
+            painter.drawText(QRectF(orig_flag.right() + 10.0, cy + 3.0, 108.0, 17.0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "LOCAL NODE")
+
+            dest_flag = QRectF(card.right() - 16.0 - fw, cy - fh / 2.0, fw, fh)
+            if is_conn and spec.code:
+                painter.setPen(QPen(dest_c1, 1.5))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(dest_flag.adjusted(-2.5, -2.5, 2.5, 2.5), 6.5, 6.5)
+            VectorFlagRenderer.draw_flag(painter, spec.code, dest_flag, radius=5.0)
+            painter.setFont(make_ui_font(9, QFont.Weight.Bold))
+            painter.setPen(QColor(self._palette.text_primary))
+            dest_txt = QRectF(dest_flag.left() - 185.0, card.top() + 8.0, 175.0, 20.0)
+            painter.drawText(dest_txt, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, I18N.t("route_dest", country=dest_title_val))
+            painter.setFont(make_mono_font(8, bold=True))
+            painter.setPen(dest_c1 if (is_conn and self._palette.is_dark) else QColor(self._palette.text_secondary))
+            painter.drawText(QRectF(dest_flag.left() - 185.0, cy + 3.0, 175.0, 17.0), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, dest_sub_ip)
+
+            track_start = orig_txt.right() + 12.0
+            track_end = dest_txt.left() - 12.0
+
+        span = abs(track_end - track_start)
+        if span > 65.0:
+            line_grad = QLinearGradient(QPointF(track_start, cy), QPointF(track_end, cy))
+            line_grad.setColorAt(0.0, QColor(22, 155, 98, 105))
+            line_grad.setColorAt(0.5, QColor(255, 208, 0, 85))
+            line_grad.setColorAt(1.0, QColor(dest_c1.red(), dest_c1.green(), dest_c1.blue(), 115))
+            painter.setPen(QPen(line_grad, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.drawLine(QPointF(track_start, cy), QPointF(track_end, cy))
+
+            act_col = (
+                QColor("#10B981")
+                if is_conn
+                else (QColor("#F97316") if self._phase == "CONNECTING" else dest_c1)
+            )
+
+            for i in range(4):
+                prog = (self._flow + i * 0.25) % 1.0
+                px = track_start + (track_end - track_start) * prog
+                alpha = int(255 * math.sin(prog * math.pi))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(act_col.red(), act_col.green(), act_col.blue(), alpha))
+                r_dot = 3.5 if self._phase in ("CONNECTING", "CONNECTED") else 2.3
+                painter.drawEllipse(QPointF(px, cy - 2.0), r_dot, r_dot)
+
+                if is_conn:
+                    rev_px = track_end + (track_start - track_end) * prog
+                    painter.setBrush(QColor(dest_c3.red(), dest_c3.green(), dest_c3.blue(), int(alpha * 0.75)))
+                    painter.drawEllipse(QPointF(rev_px, cy + 2.2), 2.5, 2.5)
+
+            if is_conn and self._ping_ms > 0:
+                mid_txt = f"ENCRYPTED | {self._ping_ms} ms"
+            elif is_conn:
+                mid_txt = "ENCRYPTED"
+            elif self._phase == "CONNECTING":
+                mid_txt = "PROBING..."
+            else:
+                mid_txt = "READY"
+
+            if self._gemini_ready and is_conn:
+                mid_txt = f"{mid_txt} | GEMINI READY"
+
+            painter.setFont(make_mono_font(8, bold=True))
+            fm = QFontMetrics(painter.font())
+            extra_icon = 16.0 if (self._gemini_ready and is_conn) else 0.0
+            pw = fm.horizontalAdvance(mid_txt) + 22.0 + extra_icon
+            mid_x = (track_start + track_end) / 2.0
+            pill_rect = QRectF(mid_x - pw / 2.0, cy - 11.5, pw, 23.0)
+
+            pill_accent = QColor("#38BDF8") if (self._gemini_ready and is_conn) else act_col
+            draw_neu_raised(painter, pill_rect, 11.5, self._palette, depth=2.6, accent_tint=pill_accent)
+
+            if self._gemini_ready and is_conn:
+                star_rect = QRectF(pill_rect.left() + 8.0, cy - 6.0, 12.0, 12.0)
+                VectorIconPainter.draw_icon(painter, "gemini", star_rect, QColor("#38BDF8"), stroke=1.5)
+                t_rect = QRectF(pill_rect.left() + 19.0, pill_rect.top(), pill_rect.width() - 24.0, pill_rect.height())
+            else:
+                t_rect = pill_rect
+
+            painter.setPen(pill_accent if self._palette.is_dark else QColor("#0F172A"))
+            painter.drawText(t_rect, Qt.AlignmentFlag.AlignCenter, mid_txt)
+
+
+class LiveSparklineWidget(QWidget):
+    def __init__(self, max_points: int = 32, stepped: bool = False, parent=None):
+        super().__init__(parent)
+        self._max_points = max_points
+        self._stepped = stepped
+        self._samples = deque([0.0] * max_points, maxlen=max_points)
+        self._palette: ThemePalette = DARK_PALETTE
+        self._custom_color: str | None = None
+        self.setMinimumHeight(36)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_palette_theme(self, palette: ThemePalette, custom_hex: str | None = None) -> None:
+        self._palette = palette
+        if custom_hex:
+            self._custom_color = custom_hex
+        self.update()
+
+    def push_sample(self, value: float) -> None:
+        self._samples.append(max(0.0, float(value or 0.0)))
+        self.update()
+
+    def reset_flat(self) -> None:
+        if any(v > 0.0 for v in self._samples):
+            self._samples = deque([0.0] * self._max_points, maxlen=self._max_points)
+            self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        w, h = float(self.width()), float(self.height())
+        if w < 14.0 or h < 14.0 or len(self._samples) < 2:
+            return
+
+        well = QRectF(1.0, 1.5, w - 2.0, h - 3.0)
+        draw_neu_inset(painter, well, 8.5, self._palette, depth=2.6)
+
+        clip = QPainterPath()
+        clip.addRoundedRect(well.adjusted(1.5, 1.5, -1.5, -1.5), 7.0, 7.0)
+        painter.save()
+        painter.setClipPath(clip)
+
+        pad_x, pad_top, pad_bot = 6.0, 6.0, 5.5
+        usable_w = w - 2.0 * pad_x
+        usable_h = h - pad_top - pad_bot
+        baseline_y = pad_top + usable_h
+
+        line_color = QColor(self._custom_color) if self._custom_color else QColor(self._palette.accent_primary)
+        peak = max(self._samples)
+
+        if peak <= 0.0001:
+            flat_col = QColor(line_color)
+            flat_col.setAlpha(68)
+            painter.setPen(QPen(flat_col, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.drawLine(QPointF(pad_x, baseline_y), QPointF(w - pad_x, baseline_y))
+            painter.restore()
+            return
+
+        pts: list[QPointF] = []
+        n = len(self._samples)
+        for idx, val in enumerate(self._samples):
+            x = pad_x + (idx / (n - 1)) * usable_w
+            norm = min(val / (peak * 1.15), 1.0)
+            y = pad_top + usable_h * (1.0 - norm)
+            pts.append(QPointF(x, y))
+
+        line_path = QPainterPath(pts[0])
+        if self._stepped:
+            for i in range(len(pts) - 1):
+                p0, p1 = pts[i], pts[i + 1]
+                line_path.lineTo(QPointF(p1.x(), p0.y()))
+                line_path.lineTo(p1)
+        else:
+            for i in range(len(pts) - 1):
+                p0, p1 = pts[i], pts[i + 1]
+                mid_x = (p0.x() + p1.x()) / 2.0
+                line_path.cubicTo(QPointF(mid_x, p0.y()), QPointF(mid_x, p1.y()), p1)
+
+        fill_path = QPainterPath(line_path)
+        fill_path.lineTo(pts[-1].x(), baseline_y + 2.0)
+        fill_path.lineTo(pts[0].x(), baseline_y + 2.0)
+        fill_path.closeSubpath()
+
+        grad = QLinearGradient(0.0, pad_top, 0.0, h)
+        top_fill = QColor(line_color)
+        top_fill.setAlpha(75 if self._palette.is_dark else 52)
+        bot_fill = QColor(line_color)
+        bot_fill.setAlpha(0)
+        grad.setColorAt(0.0, top_fill)
+        grad.setColorAt(1.0, bot_fill)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(grad)
+        painter.drawPath(fill_path)
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(line_color, 1.9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.drawPath(line_path)
+
+        if self._samples[-1] > 0.0:
+            tip = pts[-1]
+            painter.setPen(Qt.PenStyle.NoPen)
+            halo = QColor(line_color)
+            halo.setAlpha(95)
+            painter.setBrush(halo)
+            painter.drawEllipse(tip, 4.4, 4.4)
+            painter.setBrush(line_color)
+            painter.drawEllipse(tip, 2.1, 2.1)
+
+        painter.restore()

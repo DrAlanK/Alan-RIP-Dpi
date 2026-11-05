@@ -1,8 +1,17 @@
-import re
 from pathlib import Path
-from PySide6.QtCore import QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter
+from PySide6.QtCore import QRectF, QSignalBlocker, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QGuiApplication,
+    QKeySequence,
+    QPainter,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -10,144 +19,157 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QPlainTextEdit,
-    QProgressBar,
     QPushButton,
     QSpinBox,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from .animated_widgets import (
-    ActionIconPillButton,
-    AnimatedHeroConnectionCard,
+    ActionPillButton,
+    AnimatedRadarCore,
     AnimatedToggleSwitch,
-    CollapsibleAccordion,
     KineticConnectButton,
     LiveSparklineWidget,
-    RadarShieldCore,
-    SegmentedCapsuleBar,
-    SimpleChronometerWidget,
-    TaskProgressStrip,
-    TunnelRouteBridgeWidget,
+    NeuCard,
+    RouteTopologyStrip,
+    SegmentedControl,
+    SpoilerChronometer,
     VectorIconButton,
-    VectorIconPainter,
+    draw_neu_inset,
+    draw_neu_raised,
 )
 from .flag_icons import FlagBadgeWidget, GeoFlagResolver, make_flag_qicon
 from .theme import (
     DARK_PALETTE,
+    I18N,
     ThemePalette,
     apply_windows_titlebar_theme,
     enforce_english_ltr,
+    get_bool,
+    get_int,
     lock_widget_dimensions,
+    make_mono_font,
     make_transparent_scroll_area,
     make_ui_font,
-    sanitize_ui_text,
+    strip_emojis,
 )
+from .vector_icons import VectorIconPainter, make_vector_qicon
+
+SUB_UPDATE_INTERVAL_HOURS: tuple[int, ...] = (0, 1, 3, 6, 12, 24)
+
+DEFAULT_FINGERPRINTS: list[tuple[str, str]] = [
+    ("custom_poly", "Custom Polymorphic"),
+    ("random", "random"),
+    ("chrome", "chrome"),
+    ("firefox", "firefox"),
+    ("safari", "safari"),
+    ("ios", "ios"),
+    ("edge", "edge"),
+    ("qq", "qq"),
+    ("android", "android"),
+    ("360", "360"),
+]
 
 
-def get_bool_value(mapping: dict, key: str, default: bool) -> bool:
-    if not isinstance(mapping, dict):
-        return default
-    val = mapping.get(key, default)
-    if val is None:
-        return default
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, (int, float)):
-        return val != 0
-    if isinstance(val, str):
-        low = val.strip().lower()
-        if low in ("1", "true", "yes", "on"):
-            return True
-        if low in ("0", "false", "no", "off"):
-            return False
-    return default
+def set_switch_blocked(sw: AnimatedToggleSwitch, checked: bool) -> None:
+    state = bool(checked)
+    with QSignalBlocker(sw):
+        anim = getattr(sw, "_anim", None)
+        if anim is not None:
+            anim.stop()
+        sw.setChecked(state)
+        sw._offset = 1.0 if state else 0.0
+    sw.update()
 
 
-def parse_int_value(raw_val, default: int = 0) -> int:
-    if raw_val is None:
-        return default
-    if isinstance(raw_val, bool):
-        return int(raw_val)
-    if isinstance(raw_val, int):
-        return raw_val
-    if isinstance(raw_val, float):
-        return int(raw_val)
-    txt = str(raw_val).strip()
-    if not txt:
-        return default
-    try:
-        return int(float(txt))
-    except (ValueError, TypeError):
-        return default
-
-
-def parse_float_value(raw_val, default: float = 0.0) -> float:
-    if raw_val is None:
-        return default
-    if isinstance(raw_val, bool):
-        return float(int(raw_val))
-    if isinstance(raw_val, (int, float)):
-        return float(raw_val)
-    txt = str(raw_val).strip()
-    if not txt:
-        return default
-    try:
-        return float(txt)
-    except (ValueError, TypeError):
-        return default
-
-
-def pick_first_text(mapping: dict, keys: tuple[str, ...], default: str = "") -> str:
-    if not isinstance(mapping, dict):
-        return default
-    for key in keys:
-        val = mapping.get(key, None)
-        if val is not None:
-            txt = str(val).strip()
-            if txt:
-                return txt
-    return default
-
-
-def resolve_active_profile_index(
-    items: list[dict],
-    fallback_index: int = -1,
-    active_uid: str = "",
-) -> int:
-    if not items:
-        return -1
-
-    for idx, item in enumerate(items):
-        if isinstance(item, dict) and get_bool_value(item, "is_selected", False):
-            return idx
-
-    if active_uid:
-        for idx, item in enumerate(items):
-            if isinstance(item, dict):
-                uid_val = pick_first_text(item, ("uid", "profile_uid", "id"), "")
-                if uid_val and (uid_val == active_uid):
-                    return idx
-
-    for idx, item in enumerate(items):
+def normalize_vector_entries(vectors: list | None) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in vectors or []:
         if isinstance(item, dict):
-            if get_bool_value(item, "selected", False):
-                return idx
-            if get_bool_value(item, "is_active", False):
-                return idx
-            if get_bool_value(item, "active", False):
-                return idx
+            vid = str(item.get("vector_id") or item.get("id") or item.get("code") or "").strip()
+            cname = strip_emojis(str(item.get("code_name") or item.get("name") or item.get("title") or "").strip())
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            vid = str(item[0]).strip()
+            cname = strip_emojis(str(item[1]).strip())
+        else:
+            vid = str(getattr(item, "vector_id", getattr(item, "id", item)) or "").strip()
+            cname = strip_emojis(str(getattr(item, "code_name", getattr(item, "name", "")) or "").strip())
 
-    if (fallback_index >= 0) and (fallback_index < len(items)):
-        return fallback_index
+        if not vid or vid in seen:
+            continue
+        seen.add(vid)
+        label = f"{vid} — {cname}" if (cname and cname != vid) else vid
+        entries.append((vid, label))
+    return entries
 
-    return -1
+
+def normalize_fingerprint_entries(fingerprints: list | None) -> list[tuple[str, str]]:
+    if not fingerprints:
+        return list(DEFAULT_FINGERPRINTS)
+
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in fingerprints:
+        if isinstance(item, dict):
+            val = str(
+                item.get("value")
+                or item.get("id")
+                or item.get("key")
+                or item.get("fingerprint")
+                or ""
+            ).strip()
+            lbl = strip_emojis(
+                str(
+                    item.get("label")
+                    or item.get("name")
+                    or item.get("title")
+                    or val
+                ).strip()
+            )
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            val = str(item[0]).strip()
+            lbl = strip_emojis(str(item[1]).strip())
+        else:
+            val = str(item or "").strip()
+            lbl = val
+
+        if not val or val in seen:
+            continue
+        seen.add(val)
+        if val == "custom_poly" and (not lbl or lbl == "custom_poly"):
+            lbl = "Custom Polymorphic"
+        entries.append((val, lbl or val))
+
+    return entries if entries else list(DEFAULT_FINGERPRINTS)
 
 
-def format_rate_from_kbps(kbps: float) -> str:
+def extract_profile_uid(prof: dict, fallback_idx: int = 0) -> str:
+    for key in ("uid", "profile_uid", "id"):
+        val = prof.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return str(fallback_idx)
+
+
+def extract_profile_group(prof: dict) -> str:
+    for key in ("group", "group_tag", "subscription", "sub_tag", "sub_title"):
+        val = prof.get(key)
+        if val is not None and str(val).strip():
+            return strip_emojis(str(val).strip())
+    return "Manual"
+
+
+def format_rate_kbps(kbps: float) -> str:
     if kbps <= 0.0:
         return "0 B/s"
     if kbps >= 1024.0:
@@ -157,52 +179,106 @@ def format_rate_from_kbps(kbps: float) -> str:
     return f"{kbps:.1f} KB/s"
 
 
-def extract_ip_candidate(text: str) -> str:
-    if not text:
-        return ""
-    raw = str(text).strip()
-    m = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", raw)
-    if m:
-        return m.group(0)
-    if (":" in raw) and (not raw.startswith("[")):
-        return raw.split(":")[0].strip()
-    return raw
+def is_gemini_verified(item: dict) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if get_bool(item, "gemini_ok", False) or get_bool(item, "gemini_ready", False):
+        return True
+    st = str(item.get("gemini_status") or "").strip().upper()
+    return st in ("OK", "READY", "VERIFIED", "TRUE", "PASSED", "GEMINI")
 
 
-def normalize_rank_text(rank_val) -> str:
-    if rank_val is None:
-        return ""
-    raw = str(rank_val).strip()
-    if not raw:
-        return ""
-    return raw if raw.startswith("#") else f"#{raw}"
-
-
-class VectorGlyphWidget(QWidget):
-    def __init__(self, icon_name: str, size: int = 20, use_accent: bool = True, parent=None):
+class VectorGlyph(QWidget):
+    def __init__(self, icon_name: str, size: int = 26, custom_hex: str | None = None, parent=None):
         super().__init__(parent)
         self._icon_name = icon_name
-        self._use_accent = use_accent
+        self._custom_hex = custom_hex
         self._palette: ThemePalette = DARK_PALETTE
         lock_widget_dimensions(self, size, size)
 
-    def set_palette_theme(self, palette: ThemePalette):
+    def set_palette_theme(self, palette: ThemePalette, custom_hex: str | None = None) -> None:
         self._palette = palette
+        if custom_hex:
+            self._custom_hex = custom_hex
         self.update()
 
-    def paintEvent(self, _event):
+    def paintEvent(self, _event) -> None:
         painter = QPainter(self)
-        col = QColor(self._palette.accent_primary) if self._use_accent else QColor(self._palette.text_secondary)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        well = QRectF(1.0, 1.0, self.width() - 2.0, self.height() - 2.0)
+        col = QColor(self._custom_hex) if self._custom_hex else QColor(self._palette.accent_primary)
+        draw_neu_inset(painter, well, well.height() / 2.0, self._palette, depth=2.2)
+        pad = self.width() * 0.24
         VectorIconPainter.draw_icon(
             painter,
             self._icon_name,
-            QRectF(1, 1, self.width() - 2, self.height() - 2),
+            QRectF(pad, pad, self.width() - 2.0 * pad, self.height() - 2.0 * pad),
             col,
-            1.75,
+            stroke=1.65,
         )
 
 
-class NativeThemedDialog(QDialog):
+class NeuGroupTabButton(QPushButton):
+    def __init__(self, text: str, palette: ThemePalette, parent=None):
+        super().__init__(text, parent)
+        self._palette = palette
+        self._hovered = False
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(32)
+        self._sync_width()
+
+    def _sync_width(self) -> None:
+        self.setFont(make_ui_font(9, QFont.Weight.Bold))
+        fm = QFontMetrics(self.font())
+        self.setMinimumWidth(fm.horizontalAdvance(self.text()) + 28)
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self._sync_width()
+        self.update()
+
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = QRectF(2.5, 2.0, self.width() - 5.0, self.height() - 4.0)
+        accent = QColor(self._palette.accent_primary)
+
+        if self.isChecked():
+            draw_neu_raised(painter, rect, 9.5, self._palette, depth=2.8, accent_tint=accent)
+            line_w = min(22.0, rect.width() * 0.42)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(accent)
+            painter.drawRoundedRect(
+                QRectF(rect.center().x() - line_w / 2.0, rect.bottom() - 3.0, line_w, 2.0),
+                1.0,
+                1.0,
+            )
+            fg = accent if self._palette.is_dark else QColor("#9A6700")
+            painter.setFont(make_ui_font(9, QFont.Weight.ExtraBold))
+        else:
+            if self._hovered:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(accent.red(), accent.green(), accent.blue(), 20))
+                painter.drawRoundedRect(rect, 9.5, 9.5)
+            fg = QColor(self._palette.text_primary) if self._hovered else QColor(self._palette.text_muted)
+            painter.setFont(make_ui_font(9, QFont.Weight.DemiBold))
+
+        painter.setPen(fg)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.text())
+
+
+class BaseThemedDialog(QDialog):
     def __init__(self, title: str, palette: ThemePalette, parent=None):
         super().__init__(parent)
         self._palette = palette
@@ -213,2125 +289,138 @@ class NativeThemedDialog(QDialog):
             | Qt.WindowType.WindowTitleHint
             | Qt.WindowType.WindowCloseButtonHint
         )
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.setLayoutDirection(I18N.layout_direction())
         if parent is not None:
             self.setStyleSheet(parent.styleSheet())
 
-    def showEvent(self, event):
+    def showEvent(self, event) -> None:
         super().showEvent(event)
         apply_windows_titlebar_theme(self, self._palette.is_dark)
 
 
-class AdminElevationDialog(NativeThemedDialog):
-    def __init__(self, palette: ThemePalette, parent=None):
-        super().__init__("نیاز به دسترسی Administrator", palette, parent)
-        self.setMinimumSize(450, 210)
-        self.resize(485, 225)
+class SubscriptionManagerDialog(BaseThemedDialog):
+    add_requested = Signal(str, str)
+    refresh_requested = Signal()
+    delete_requested = Signal(int)
+    auto_update_hours_changed = Signal(int)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 18, 22, 18)
-        layout.setSpacing(14)
-
-        title_lbl = QLabel("فعال‌سازی شبکه مجازی کل سیستم (TUN)")
-        title_lbl.setFont(make_ui_font(13, QFont.Weight.ExtraBold))
-        layout.addWidget(title_lbl)
-
-        mid_row = QHBoxLayout()
-        mid_row.setSpacing(14)
-        glyph = VectorGlyphWidget("tun_shield", size=38, use_accent=True)
-        glyph.set_palette_theme(palette)
-
-        desc = QLabel(
-            "برای ساخت کارت شبکه مجازی TUN و هدایت تمام ترافیک سیستم‌عامل از تونل امن، "
-            "برنامه باید با دسترسی Administrator ویندوز اجرا شود."
-        )
-        desc.setObjectName("SecondaryLabel")
-        desc.setWordWrap(True)
-
-        mid_row.addWidget(glyph, 0, Qt.AlignmentFlag.AlignTop)
-        mid_row.addWidget(desc, 1)
-        layout.addLayout(mid_row)
-
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-
-        cancel_btn = QPushButton("انصراف")
-        cancel_btn.setObjectName("GhostPillBtn")
-        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        cancel_btn.clicked.connect(self.reject)
-
-        elevate_btn = QPushButton("اجرای مجدد با دسترسی Administrator")
-        elevate_btn.setObjectName("AccentBtn")
-        elevate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        elevate_btn.clicked.connect(self.accept)
-
-        btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(elevate_btn)
-        layout.addStretch()
-        layout.addLayout(btn_row)
-
-
-class RenameProfileDialog(NativeThemedDialog):
-    def __init__(self, current_name: str, palette: ThemePalette, parent=None):
-        super().__init__("تغییر نام کانفیگ", palette, parent)
-        self.setMinimumSize(380, 165)
-        self.resize(420, 175)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(12)
-
-        lbl = QLabel("نام جدید پروفایل را وارد کنید:")
-        lbl.setFont(make_ui_font(11, QFont.Weight.Bold))
-        layout.addWidget(lbl)
-
-        self.name_edit = QLineEdit(current_name)
-        self.name_edit.selectAll()
-        layout.addWidget(self.name_edit)
-
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        cancel_btn = QPushButton("انصراف")
-        cancel_btn.setObjectName("GhostPillBtn")
-        cancel_btn.clicked.connect(self.reject)
-
-        save_btn = QPushButton("ذخیره نام")
-        save_btn.setObjectName("AccentBtn")
-        save_btn.clicked.connect(self.accept)
-
-        btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(save_btn)
-        layout.addStretch()
-        layout.addLayout(btn_row)
-
-    def new_name(self) -> str:
-        return self.name_edit.text().strip()
-
-
-class ConfirmClearAllDialog(NativeThemedDialog):
-    def __init__(self, count: int, palette: ThemePalette, parent=None):
-        super().__init__("حذف کل کانفیگ‌ها", palette, parent)
-        self.setMinimumSize(440, 210)
-        self.resize(470, 225)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 18, 22, 18)
-        layout.setSpacing(12)
-
-        hdr = QLabel("تایید دو مرحله‌ای تخلیه مخزن")
-        hdr.setFont(make_ui_font(13, QFont.Weight.ExtraBold))
-        layout.addWidget(hdr)
-
-        desc = QLabel(
-            f"شما در حال حذف دائمی تمام {count} کانفیگ موجود در مخزن هستید. این عملیات قابل بازگشت نیست."
-        )
-        desc.setObjectName("SecondaryLabel")
-        desc.setWordWrap(True)
-        layout.addWidget(desc)
-
-        self.confirm_chk = QCheckBox("تایید می‌کنم که تمام کانفیگ‌های مخزن به صورت کامل پاک شوند.")
-        layout.addWidget(self.confirm_chk)
-
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        cancel_btn = QPushButton("انصراف")
-        cancel_btn.setObjectName("GhostPillBtn")
-        cancel_btn.clicked.connect(self.reject)
-
-        self.delete_btn = QPushButton("حذف قطعی کل کانفیگ‌ها")
-        self.delete_btn.setObjectName("DangerSolidBtn")
-        self.delete_btn.setEnabled(False)
-        self.delete_btn.clicked.connect(self.accept)
-        self.confirm_chk.toggled.connect(self.delete_btn.setEnabled)
-
-        btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(self.delete_btn)
-        layout.addStretch()
-        layout.addLayout(btn_row)
-
-
-class ConfigEditorDialog(NativeThemedDialog):
     def __init__(
         self,
-        index: int,
-        initial_data: dict | None,
-        vectors: list | None,
+        subscriptions: list,
+        auto_update_hours: int,
         palette: ThemePalette,
         parent=None,
     ):
-        title_str = "افزودن دستی کانفیگ جدید" if (index < 0) else "ویرایش کامل کانفیگ"
-        super().__init__(title_str, palette, parent)
-        self._index = index
-        self._initial = dict(initial_data) if isinstance(initial_data, dict) else {}
-
-        self.setMinimumSize(700, 540)
-        self.resize(790, 650)
+        super().__init__(I18N.t("subs_dlg_title"), palette, parent)
+        self._palette = palette
+        self._item_cards: list[NeuCard] = []
+        self.setMinimumSize(580, 420)
+        self.resize(640, 460)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(22, 16, 22, 18)
+        root.setContentsMargins(20, 16, 20, 18)
         root.setSpacing(12)
 
-        top_row = QHBoxLayout()
-        hdr_lbl = QLabel(title_str)
+        hdr_row = QHBoxLayout()
+        hdr_lbl = QLabel(I18N.t("subs_dlg_title"))
         hdr_lbl.setFont(make_ui_font(13, QFont.Weight.ExtraBold))
-        self.preview_flag = FlagBadgeWidget(GeoFlagResolver.resolve_code(self._initial), width=32, height=21)
-        top_row.addWidget(hdr_lbl)
-        top_row.addStretch()
-        top_row.addWidget(self.preview_flag)
-        root.addLayout(top_row)
-
-        form_host = QWidget()
-        form_vbox = QVBoxLayout(form_host)
-        form_vbox.setContentsMargins(2, 2, 6, 6)
-        form_vbox.setSpacing(12)
-
-        self.fields_card = QFrame()
-        self.fields_card.setObjectName("GlassCard")
-        grid = QGridLayout(self.fields_card)
-        grid.setContentsMargins(16, 14, 16, 16)
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(8)
-
-        self.name_edit = QLineEdit(pick_first_text(self._initial, ("name", "title"), ""))
-        self.name_edit.setPlaceholderText("مثلاً DE Direct-German")
-        self.name_edit.textChanged.connect(self._update_flag_preview)
-
-        self.protocol_combo = QComboBox()
-        for proto in ("vless", "vmess", "trojan", "ss"):
-            self.protocol_combo.addItem(proto.upper(), proto)
-        enforce_english_ltr(self.protocol_combo, mono_size=10, bold=True)
-
-        init_addr = pick_first_text(self._initial, ("host", "original_host", "address"), "")
-        self.address_edit = QLineEdit(init_addr)
-        self.address_edit.setPlaceholderText("104.18.36.214 / domain.com")
-        enforce_english_ltr(self.address_edit, mono_size=10)
-        self.address_edit.textChanged.connect(self._update_flag_preview)
-
-        init_port = parse_int_value(self._initial.get("port", 443), 443)
-        if (init_port < 1) or (init_port > 65535):
-            init_port = 443
-        self.port_spin = QSpinBox()
-        self.port_spin.setRange(1, 65535)
-        self.port_spin.setValue(init_port)
-        enforce_english_ltr(self.port_spin, mono_size=10)
-
-        cred_val = pick_first_text(self._initial, ("uuid_or_password", "uuid", "password"), "")
-        self.uuid_edit = QLineEdit(cred_val)
-        self.uuid_edit.setPlaceholderText("UUID / Trojan or SS Password")
-        enforce_english_ltr(self.uuid_edit, mono_size=10)
-
-        self.vector_combo = QComboBox()
-        enforce_english_ltr(self.vector_combo, mono_size=10, bold=True)
-        self._populate_vectors(vectors if isinstance(vectors, list) else [])
-
-        self.network_combo = QComboBox()
-        for net in ("ws", "tcp", "grpc", "httpupgrade"):
-            self.network_combo.addItem(net, net)
-        enforce_english_ltr(self.network_combo, mono_size=10)
-
-        self.security_combo = QComboBox()
-        for sec in ("tls", "reality", "none"):
-            self.security_combo.addItem(sec, sec)
-        enforce_english_ltr(self.security_combo, mono_size=10)
-
-        self.sni_edit = QLineEdit(pick_first_text(self._initial, ("sni", "server_name"), ""))
-        self.sni_edit.setPlaceholderText("sni.example.com")
-        enforce_english_ltr(self.sni_edit, mono_size=10)
-        self.sni_edit.textChanged.connect(self._update_flag_preview)
-
-        self.host_edit = QLineEdit(pick_first_text(self._initial, ("host_header",), ""))
-        self.host_edit.setPlaceholderText("cdn.example.com")
-        enforce_english_ltr(self.host_edit, mono_size=10)
-
-        self.path_edit = QLineEdit(pick_first_text(self._initial, ("path", "service_name"), "/"))
-        self.path_edit.setPlaceholderText("/ws or grpc-service")
-        enforce_english_ltr(self.path_edit, mono_size=10)
-
-        self.alpn_combo = QComboBox()
-        self.alpn_combo.setEditable(True)
-        for alpn_opt in ("", "http/1.1", "h2,http/1.1", "h2"):
-            self.alpn_combo.addItem(alpn_opt)
-        enforce_english_ltr(self.alpn_combo, mono_size=10)
-
-        self.fp_combo = QComboBox()
-        self.fp_combo.setEditable(True)
-        for fp_opt in ("chrome", "safari", "firefox", "ios", "edge", "randomized", ""):
-            self.fp_combo.addItem(fp_opt)
-        enforce_english_ltr(self.fp_combo, mono_size=10)
-
-        self.flow_combo = QComboBox()
-        self.flow_combo.setEditable(True)
-        for fl_opt in ("", "xtls-rprx-vision"):
-            self.flow_combo.addItem(fl_opt)
-        enforce_english_ltr(self.flow_combo, mono_size=10)
-
-        pbk_val = pick_first_text(self._initial, ("public_key", "pbk"), "")
-        self.pbk_edit = QLineEdit(pbk_val)
-        self.pbk_edit.setPlaceholderText("Reality PublicKey (pbk)")
-        enforce_english_ltr(self.pbk_edit, mono_size=10)
-
-        sid_val = pick_first_text(self._initial, ("short_id", "sid"), "")
-        self.sid_edit = QLineEdit(sid_val)
-        self.sid_edit.setPlaceholderText("Reality ShortId (sid)")
-        enforce_english_ltr(self.sid_edit, mono_size=10)
-
-        spec = [
-            ("نام کانفیگ:", self.name_edit, 0, 0),
-            ("پروتکل (Protocol):", self.protocol_combo, 0, 1),
-            ("آدرس سرور / IP:", self.address_edit, 1, 0),
-            ("پورت (Port):", self.port_spin, 1, 1),
-            ("شناسه UUID / Password:", self.uuid_edit, 2, 0),
-            ("متد عبوری مقیدشده:", self.vector_combo, 2, 1),
-            ("شبکه انتقال (Network):", self.network_combo, 3, 0),
-            ("لایه امنیت (Security):", self.security_combo, 3, 1),
-            ("دامنه SNI:", self.sni_edit, 4, 0),
-            ("هدر Host:", self.host_edit, 4, 1),
-            ("مسیر Path / ServiceName:", self.path_edit, 5, 0),
-            ("مقدار ALPN:", self.alpn_combo, 5, 1),
-            ("اثرانگشت (Fingerprint):", self.fp_combo, 6, 0),
-            ("جریان (Flow):", self.flow_combo, 6, 1),
-            ("کلید عمومی (PublicKey / pbk):", self.pbk_edit, 7, 0),
-            ("شناسه کوتاه (ShortId / sid):", self.sid_edit, 7, 1),
-        ]
-
-        for label_text, widget, r, c in spec:
-            lbl = QLabel(label_text)
-            lbl.setObjectName("SecondaryLabel")
-            grid.addWidget(lbl, r * 2, c)
-            grid.addWidget(widget, r * 2 + 1, c)
-
-        form_vbox.addWidget(self.fields_card)
-
-        raw_card = QFrame()
-        raw_card.setObjectName("SubtleCard")
-        raw_vbox = QVBoxLayout(raw_card)
-        raw_vbox.setContentsMargins(16, 12, 16, 14)
-        raw_vbox.setSpacing(8)
-
-        raw_top = QHBoxLayout()
-        raw_lbl = QLabel("لینک خام کانفیگ (Raw URI):")
-        raw_lbl.setFont(make_ui_font(10, QFont.Weight.Bold))
-
-        sw_lbl = QLabel("ویرایش مستقیم از روی لینک خام")
-        sw_lbl.setObjectName("SecondaryLabel")
-        self.sw_use_raw = AnimatedToggleSwitch(checked=get_bool_value(self._initial, "use_raw_uri", False))
-        self.sw_use_raw.set_palette_theme(palette)
-        self.sw_use_raw.toggled.connect(self._sync_raw_mode)
-
-        raw_top.addWidget(raw_lbl)
-        raw_top.addStretch()
-        raw_top.addWidget(sw_lbl)
-        raw_top.addWidget(self.sw_use_raw)
-        raw_vbox.addLayout(raw_top)
-
-        raw_uri_str = pick_first_text(self._initial, ("raw_uri", "uri"), "")
-        self.raw_uri_edit = QPlainTextEdit(raw_uri_str)
-        self.raw_uri_edit.setObjectName("RawUriEdit")
-        self.raw_uri_edit.setPlaceholderText("vless://uuid@host:443?security=tls&type=ws#Title")
-        self.raw_uri_edit.setMinimumHeight(74)
-        self.raw_uri_edit.setMaximumHeight(110)
-        enforce_english_ltr(self.raw_uri_edit, mono_size=10)
-        raw_vbox.addWidget(self.raw_uri_edit)
-
-        form_vbox.addWidget(raw_card)
-        form_vbox.addStretch()
-
-        scroll = make_transparent_scroll_area(form_host)
-        root.addWidget(scroll, 1)
-
-        footer = QHBoxLayout()
-        footer.addStretch()
-        cancel_btn = QPushButton("انصراف")
-        cancel_btn.setObjectName("GhostPillBtn")
-        cancel_btn.clicked.connect(self.reject)
-
-        save_btn = QPushButton("ذخیره تغییرات")
-        save_btn.setObjectName("AccentBtn")
-        save_btn.clicked.connect(self.accept)
-
-        footer.addWidget(cancel_btn)
-        footer.addWidget(save_btn)
-        root.addLayout(footer)
-
-        self._apply_initial_selections()
-        self._sync_raw_mode(self.sw_use_raw.isChecked())
-
-    def _update_flag_preview(self):
-        code = GeoFlagResolver.resolve_code(
-            self.name_edit.text(),
-            self.sni_edit.text(),
-            self.address_edit.text(),
-        )
-        self.preview_flag.set_country_code(code)
-
-    def _populate_vectors(self, vectors: list):
-        self.vector_combo.clear()
-        self.vector_combo.addItem("AUTO", "AUTO")
-        seen = {"AUTO"}
-        for item in vectors:
-            if isinstance(item, dict):
-                vid = pick_first_text(item, ("id", "vector_id", "code"), "")
-                vname = sanitize_ui_text(pick_first_text(item, ("name", "title"), ""))
-            else:
-                vid = str(item).strip()
-                vname = ""
-            if vid and (vid not in seen):
-                seen.add(vid)
-                caption = f"{vid} | {vname}" if (vname and (vname != vid)) else vid
-                self.vector_combo.addItem(caption, vid)
-
-        for i in range(1, 17):
-            code = f"VEC-{i:02d}"
-            if code not in seen:
-                seen.add(code)
-                self.vector_combo.addItem(code, code)
-
-    def _apply_initial_selections(self):
-        proto = pick_first_text(self._initial, ("protocol",), "vless").lower()
-        p_idx = self.protocol_combo.findData(proto)
-        if p_idx >= 0:
-            self.protocol_combo.setCurrentIndex(p_idx)
-
-        net = pick_first_text(self._initial, ("network",), "ws").lower()
-        n_idx = self.network_combo.findData(net)
-        if n_idx >= 0:
-            self.network_combo.setCurrentIndex(n_idx)
-
-        sec = pick_first_text(self._initial, ("security",), "tls").lower()
-        s_idx = self.security_combo.findData(sec)
-        if s_idx >= 0:
-            self.security_combo.setCurrentIndex(s_idx)
-
-        pref_vec = pick_first_text(self._initial, ("preferred_vector_id", "cached_vector_id"), "AUTO")
-        v_idx = self.vector_combo.findData(pref_vec)
-        if v_idx >= 0:
-            self.vector_combo.setCurrentIndex(v_idx)
-
-        self.alpn_combo.setCurrentText(pick_first_text(self._initial, ("alpn",), ""))
-        self.fp_combo.setCurrentText(pick_first_text(self._initial, ("fingerprint",), "chrome"))
-        self.flow_combo.setCurrentText(pick_first_text(self._initial, ("flow",), ""))
-
-    def _sync_raw_mode(self, use_raw: bool):
-        self.fields_card.setEnabled(not use_raw)
-        self.raw_uri_edit.setReadOnly(not use_raw)
-
-    def collect_data(self) -> dict:
-        out = dict(self._initial)
-        name_txt = self.name_edit.text().strip()
-        if not name_txt:
-            name_txt = "Alan Profile"
-        addr_txt = self.address_edit.text().strip()
-        pbk_txt = self.pbk_edit.text().strip()
-        sid_txt = self.sid_edit.text().strip()
-        raw_txt = self.raw_uri_edit.toPlainText().strip()
-        vec_data = self.vector_combo.currentData()
-        pref_vec = str(vec_data) if (vec_data is not None and str(vec_data).strip()) else "AUTO"
-        proto_data = self.protocol_combo.currentData()
-        net_data = self.network_combo.currentData()
-        sec_data = self.security_combo.currentData()
-
-        out.update(
-            {
-                "name": name_txt,
-                "protocol": str(proto_data) if proto_data is not None else "vless",
-                "host": addr_txt,
-                "address": addr_txt,
-                "port": int(self.port_spin.value()),
-                "uuid_or_password": self.uuid_edit.text().strip(),
-                "network": str(net_data) if net_data is not None else "ws",
-                "security": str(sec_data) if sec_data is not None else "tls",
-                "sni": self.sni_edit.text().strip(),
-                "host_header": self.host_edit.text().strip(),
-                "path": self.path_edit.text().strip(),
-                "alpn": self.alpn_combo.currentText().strip(),
-                "fingerprint": self.fp_combo.currentText().strip(),
-                "flow": self.flow_combo.currentText().strip(),
-                "public_key": pbk_txt,
-                "pbk": pbk_txt,
-                "short_id": sid_txt,
-                "sid": sid_txt,
-                "preferred_vector_id": pref_vec,
-                "raw_uri": raw_txt,
-                "uri": raw_txt,
-                "use_raw_uri": bool(self.sw_use_raw.isChecked()),
-            }
-        )
-        return out
-
-
-class TelemetryGlassCard(QFrame):
-    def __init__(
-        self,
-        title: str,
-        icon_name: str,
-        with_sparkline: bool = True,
-        white_tint: bool = False,
-        with_flag: bool = False,
-        parent=None,
-    ):
-        super().__init__(parent)
-        self.setObjectName("GlassCard")
-        self.setMinimumHeight(114)
-        self._white_tint = white_tint
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 10)
-        layout.setSpacing(4)
-
-        top_row = QHBoxLayout()
-        top_row.setSpacing(6)
-        self.icon_widget = VectorGlyphWidget(icon_name, size=18, use_accent=not white_tint)
-        self.title_lbl = QLabel(title)
-        self.title_lbl.setObjectName("MutedLabel")
-        self.title_lbl.setFont(make_ui_font(9, QFont.Weight.DemiBold))
-        top_row.addWidget(self.icon_widget)
-        top_row.addWidget(self.title_lbl)
-        top_row.addStretch()
-
-        self.flag_badge: FlagBadgeWidget | None = None
-        if with_flag:
-            self.flag_badge = FlagBadgeWidget("GLOBAL", width=26, height=17)
-            top_row.addWidget(self.flag_badge)
-
-        self.value_lbl = QLabel("—")
-        enforce_english_ltr(self.value_lbl, mono_size=13, bold=True)
-        self.value_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-
-        layout.addLayout(top_row)
-        layout.addWidget(self.value_lbl)
-
-        self.sparkline = None
-        self.sub_lbl = None
-        if with_sparkline:
-            self.sparkline = LiveSparklineWidget()
-            layout.addWidget(self.sparkline)
-        else:
-            self.sub_lbl = QLabel("آماده دریافت مسیر")
-            self.sub_lbl.setObjectName("MutedLabel")
-            self.sub_lbl.setFont(make_ui_font(9, QFont.Weight.Medium))
-            layout.addStretch()
-            layout.addWidget(self.sub_lbl)
-
-    def set_country_info(self, code: str, is_connected: bool):
-        spec = GeoFlagResolver.get_spec(code)
-        if self.flag_badge is not None:
-            self.flag_badge.set_country_code(spec.code)
-        if self.sub_lbl is not None:
-            if is_connected:
-                self.sub_lbl.setText(f"خروجی: {spec.fa_name} | مسیر امن فعال")
-            else:
-                self.sub_lbl.setText(f"مقصد انتخابی: {spec.fa_name}")
-
-    def set_palette_theme(self, palette: ThemePalette):
-        self.icon_widget.set_palette_theme(palette)
-        if self.sparkline:
-            self.sparkline.set_palette_theme(palette, secondary_tint=self._white_tint)
-
-
-class HomePage(QWidget):
-    connect_toggled = Signal()
-    quick_paste_clicked = Signal()
-    hunt_best_requested = Signal()
-    profile_selected = Signal(int)
-    quick_setting_changed = Signal(dict)
-    tun_toggled = Signal(bool)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._palette: ThemePalette = DARK_PALETTE
-        self._ui_phase = "IDLE"
-        self._is_connected = False
-        self._profiles_list: list[dict] = []
-        self._active_profile_idx = -1
-        self._active_profile_uid = ""
-        self._last_egress_ip = ""
-        self._last_ping_ms = 0
-        self._last_snap: dict = {}
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(20, 12, 20, 14)
-        root.setSpacing(12)
-
-        top_bar = QFrame()
-        top_bar.setObjectName("PillBar")
-        top_layout = QHBoxLayout(top_bar)
-        top_layout.setContentsMargins(14, 8, 14, 8)
-        top_layout.setSpacing(10)
-
-        prof_lbl = QLabel("پروفایل فعال:")
-        prof_lbl.setObjectName("SecondaryLabel")
-        prof_lbl.setFont(make_ui_font(10, QFont.Weight.Bold))
-
-        self.profile_combo = QComboBox()
-        self.profile_combo.setMinimumWidth(210)
-        self.profile_combo.setIconSize(QSize(24, 16))
-        self.profile_combo.setFont(make_ui_font(10, QFont.Weight.DemiBold))
-        self.profile_combo.currentIndexChanged.connect(self._on_combo_changed)
-
-        self.quick_paste_btn = QPushButton("افزودن از کلیپ‌بورد")
-        self.quick_paste_btn.setObjectName("GhostPillBtn")
-        self.quick_paste_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.quick_paste_btn.clicked.connect(self.quick_paste_clicked.emit)
-
-        self.hunt_best_btn = ActionIconPillButton(
-            "hunter",
-            "شکار برترین کانفیگ مخزن و اتصال",
-            golden=True,
-        )
-        self.hunt_best_btn.clicked.connect(self.hunt_best_requested.emit)
-
-        self.live_pill_lbl = QLabel("STANDBY")
-        self.live_pill_lbl.setObjectName("PhaseStandby")
-        enforce_english_ltr(self.live_pill_lbl, mono_size=10, bold=True)
-
-        top_layout.addWidget(prof_lbl)
-        top_layout.addWidget(self.profile_combo, 1)
-        top_layout.addWidget(self.quick_paste_btn)
-        top_layout.addWidget(self.hunt_best_btn)
-        top_layout.addWidget(self.live_pill_lbl)
-        root.addWidget(top_bar)
-
-        self.hero_card = AnimatedHeroConnectionCard()
-        hero_vbox = QVBoxLayout(self.hero_card)
-        hero_vbox.setContentsMargins(26, 20, 26, 18)
-        hero_vbox.setSpacing(14)
-
-        upper_hero = QHBoxLayout()
-        upper_hero.setSpacing(26)
-
-        self.radar_core = RadarShieldCore()
-        self.radar_core.clicked.connect(self.connect_toggled.emit)
-
-        status_col = QVBoxLayout()
-        status_col.setSpacing(10)
-        status_col.addStretch()
-
-        headline_row = QHBoxLayout()
-        headline_row.setSpacing(12)
-
-        self.headline_lbl = QLabel("آماده اتصال")
-        self.headline_lbl.setObjectName("HeadlineLabel")
-        self.headline_lbl.setFont(make_ui_font(21, QFont.Weight.ExtraBold))
-
-        self.dest_pill_frame = QFrame()
-        self.dest_pill_frame.setObjectName("SubtleCard")
-        dp_row = QHBoxLayout(self.dest_pill_frame)
-        dp_row.setContentsMargins(10, 4, 10, 4)
-        dp_row.setSpacing(8)
-        self.dest_flag_badge = FlagBadgeWidget("GLOBAL", width=28, height=18)
-        self.dest_country_lbl = QLabel("مسیر جهانی")
-        self.dest_country_lbl.setFont(make_ui_font(10, QFont.Weight.Bold))
-        dp_row.addWidget(self.dest_flag_badge)
-        dp_row.addWidget(self.dest_country_lbl)
-
-        headline_row.addWidget(self.headline_lbl)
-        headline_row.addWidget(self.dest_pill_frame)
-        headline_row.addStretch()
-
-        self.detail_lbl = QLabel("موتور هوشمند آماده برقراری تونل امن و یافتن تمیزترین مسیر عبوری است.")
-        self.detail_lbl.setObjectName("SecondaryLabel")
-        self.detail_lbl.setFont(make_ui_font(11, QFont.Weight.Medium))
-        self.detail_lbl.setWordWrap(True)
-
-        self.scan_progress = QProgressBar()
-        self.scan_progress.setObjectName("GoldProgress")
-        self.scan_progress.setMinimumHeight(7)
-        self.scan_progress.setMaximumHeight(8)
-        self.scan_progress.setTextVisible(False)
-        self.scan_progress.setRange(0, 100)
-        self.scan_progress.setValue(0)
-        enforce_english_ltr(self.scan_progress, mono_size=9)
-        self.scan_progress.hide()
-
-        action_row = QHBoxLayout()
-        action_row.setSpacing(14)
-
-        self.connect_btn = KineticConnectButton()
-        self.connect_btn.clicked.connect(self.connect_toggled.emit)
-
-        self.chronometer = SimpleChronometerWidget()
-
-        action_row.addWidget(self.connect_btn)
-        action_row.addWidget(self.chronometer)
-        action_row.addStretch()
-
-        status_col.addLayout(headline_row)
-        status_col.addWidget(self.detail_lbl)
-        status_col.addWidget(self.scan_progress)
-        status_col.addSpacing(2)
-        status_col.addLayout(action_row)
-        status_col.addStretch()
-
-        upper_hero.addWidget(self.radar_core, 0, Qt.AlignmentFlag.AlignVCenter)
-        upper_hero.addLayout(status_col, 1)
-
-        self.route_bridge = TunnelRouteBridgeWidget()
-
-        hero_vbox.addLayout(upper_hero, 1)
-        hero_vbox.addWidget(self.route_bridge)
-        root.addWidget(self.hero_card, 1)
-
-        cards_row = QHBoxLayout()
-        cards_row.setSpacing(12)
-
-        self.ip_card = TelemetryGlassCard(
-            "آدرس IP خروجی",
-            "ip_globe",
-            with_sparkline=False,
-            with_flag=True,
-        )
-        self.rx_card = TelemetryGlassCard("سرعت دانلود", "download", with_sparkline=True, white_tint=False)
-        self.tx_card = TelemetryGlassCard("سرعت آپلود", "upload", with_sparkline=True, white_tint=True)
-        self.ping_card = TelemetryGlassCard("پینگ و پایداری", "wave", with_sparkline=True, white_tint=False)
-
-        self.rx_card.value_lbl.setText("0 B/s")
-        self.tx_card.value_lbl.setText("0 B/s")
-
-        cards_row.addWidget(self.ip_card, 1)
-        cards_row.addWidget(self.rx_card, 1)
-        cards_row.addWidget(self.tx_card, 1)
-        cards_row.addWidget(self.ping_card, 1)
-        root.addLayout(cards_row)
-
-        bottom_strip = QFrame()
-        bottom_strip.setObjectName("PillBar")
-        bot_layout = QHBoxLayout(bottom_strip)
-        bot_layout.setContentsMargins(14, 9, 14, 9)
-        bot_layout.setSpacing(10)
-
-        self.sys_proxy_switch = AnimatedToggleSwitch(checked=True)
-        self.sys_proxy_switch.toggled.connect(self._emit_quick_settings)
-        lbl_proxy = QLabel("پروکسی سیستم ویندوز")
-        lbl_proxy.setObjectName("SecondaryLabel")
-
-        self.autopilot_switch = AnimatedToggleSwitch(checked=True)
-        self.autopilot_switch.toggled.connect(self._emit_quick_settings)
-        lbl_auto = QLabel("اتصال هوشمند AutoPilot")
-        lbl_auto.setObjectName("SecondaryLabel")
-
-        self.tun_switch = AnimatedToggleSwitch(checked=False)
-        self.tun_switch.toggled.connect(self.tun_toggled.emit)
-        lbl_tun = QLabel("شبکه مجازی کل سیستم (TUN)")
-        lbl_tun.setObjectName("SecondaryLabel")
-
-        self.tun_status_pill = QLabel("TUN OFF")
-        self.tun_status_pill.setObjectName("TunOffPill")
-        enforce_english_ltr(self.tun_status_pill, mono_size=9, bold=True)
-
-        self.vector_badge = QLabel("AUTO-HYBRID")
-        self.vector_badge.setObjectName("BadgePill")
-        enforce_english_ltr(self.vector_badge, mono_size=10, bold=True)
-
-        bot_layout.addWidget(self.sys_proxy_switch)
-        bot_layout.addWidget(lbl_proxy)
-        bot_layout.addSpacing(8)
-        bot_layout.addWidget(self.autopilot_switch)
-        bot_layout.addWidget(lbl_auto)
-        bot_layout.addSpacing(8)
-        bot_layout.addWidget(self.tun_switch)
-        bot_layout.addWidget(lbl_tun)
-        bot_layout.addWidget(self.tun_status_pill)
-        bot_layout.addStretch()
-
-        vec_caption = QLabel("هسته:")
-        vec_caption.setObjectName("MutedLabel")
-        bot_layout.addWidget(vec_caption)
-        bot_layout.addWidget(self.vector_badge)
-
-        root.addWidget(bottom_strip)
-        self._refresh_geo_visuals()
-
-    def _resolve_active_country(self) -> str:
-        if self._is_connected and bool(self._last_snap):
-            snap_code = GeoFlagResolver.resolve_code(self._last_snap)
-            if snap_code != "GLOBAL":
-                return snap_code
-
-        if (self._active_profile_idx >= 0) and (self._active_profile_idx < len(self._profiles_list)):
-            prof_code = GeoFlagResolver.resolve_code(self._profiles_list[self._active_profile_idx])
-            if prof_code != "GLOBAL":
-                return prof_code
-
-        if self._last_snap:
-            return GeoFlagResolver.resolve_code(self._last_snap)
-        return "GLOBAL"
-
-    def _refresh_geo_visuals(self):
-        code = self._resolve_active_country()
-        spec = GeoFlagResolver.get_spec(code)
-
-        self.hero_card.set_visual_context(spec.code, self._ui_phase)
-        self.radar_core.set_country_code(spec.code)
-        self.dest_flag_badge.set_country_code(spec.code)
-        self.dest_country_lbl.setText(f"{spec.fa_name}  |  {spec.code}")
-        self.route_bridge.set_route_state(
-            spec.code,
-            self._last_egress_ip,
-            self._last_ping_ms,
-            self._ui_phase,
-        )
-        self.ip_card.set_country_info(spec.code, self._is_connected)
-
-    def _on_combo_changed(self, idx: int):
-        if idx >= 0:
-            self._active_profile_idx = idx
-            if idx < len(self._profiles_list):
-                self._active_profile_uid = pick_first_text(
-                    self._profiles_list[idx],
-                    ("uid", "profile_uid", "id"),
-                    "",
-                )
-            self._refresh_geo_visuals()
-            self.profile_selected.emit(idx)
-
-    def _emit_quick_settings(self):
-        self.quick_setting_changed.emit(
-            {
-                "system_proxy": self.sys_proxy_switch.isChecked(),
-                "autopilot": self.autopilot_switch.isChecked(),
-            }
-        )
-
-    def set_tun_switch_silent(self, checked: bool):
-        self.tun_switch.set_CheckedSilent(bool(checked))
-
-    def apply_tun_status(self, active: bool, detail: str = ""):
-        self.tun_switch.set_CheckedSilent(bool(active))
-        self.tun_status_pill.setText("TUN ACTIVE" if active else "TUN OFF")
-        target_obj = "TunActivePill" if active else "TunOffPill"
-        if self.tun_status_pill.objectName() != target_obj:
-            self.tun_status_pill.setObjectName(target_obj)
-            self.tun_status_pill.style().unpolish(self.tun_status_pill)
-            self.tun_status_pill.style().polish(self.tun_status_pill)
-        if detail:
-            self.tun_status_pill.setToolTip(sanitize_ui_text(detail))
-
-    def sync_switches(self, settings: dict):
-        if "system_proxy" in settings:
-            self.sys_proxy_switch.set_CheckedSilent(get_bool_value(settings, "system_proxy", True))
-        elif "enable_system_proxy" in settings:
-            self.sys_proxy_switch.set_CheckedSilent(get_bool_value(settings, "enable_system_proxy", True))
-
-        if "autopilot" in settings:
-            self.autopilot_switch.set_CheckedSilent(get_bool_value(settings, "autopilot", True))
-        elif "auto_pilot" in settings:
-            self.autopilot_switch.set_CheckedSilent(get_bool_value(settings, "auto_pilot", True))
-
-        if "tun_enabled" in settings:
-            self.apply_tun_status(get_bool_value(settings, "tun_enabled", False))
-
-    def set_selected_profile_silent(self, selected_index: int = -1, active_uid: str = ""):
-        if active_uid:
-            self._active_profile_uid = active_uid
-        if not self._profiles_list:
-            if selected_index >= 0:
-                self._active_profile_idx = selected_index
-            return
-
-        target_idx = -1
-        if self._active_profile_uid:
-            for idx, item in enumerate(self._profiles_list):
-                uid_val = pick_first_text(item, ("uid", "profile_uid", "id"), "")
-                if uid_val and (uid_val == self._active_profile_uid):
-                    target_idx = idx
-                    break
-
-        if (target_idx < 0) and (selected_index >= 0) and (selected_index < len(self._profiles_list)):
-            target_idx = selected_index
-
-        if (target_idx >= 0) and (target_idx != self.profile_combo.currentIndex()):
-            self._active_profile_idx = target_idx
-            self.profile_combo.blockSignals(True)
-            self.profile_combo.setCurrentIndex(target_idx)
-            self.profile_combo.blockSignals(False)
-            self._refresh_geo_visuals()
-
-    def set_profiles(self, items: list[dict], active_index: int = -1, active_uid: str = ""):
-        self._profiles_list = list(items) if isinstance(items, list) else []
-        if active_uid:
-            self._active_profile_uid = active_uid
-
-        resolved_idx = resolve_active_profile_index(
-            self._profiles_list,
-            fallback_index=active_index,
-            active_uid=self._active_profile_uid,
-        )
-        if (resolved_idx < 0) and (self._active_profile_idx >= 0) and (self._active_profile_idx < len(self._profiles_list)):
-            resolved_idx = self._active_profile_idx
-
-        self._active_profile_idx = resolved_idx
-
-        self.profile_combo.blockSignals(True)
-        self.profile_combo.clear()
-        for idx, item in enumerate(self._profiles_list):
-            raw_name = sanitize_ui_text(pick_first_text(item, ("name", "title"), f"Profile #{idx + 1}"))
-            clean_name = GeoFlagResolver.clean_display_name(raw_name)
-            if not clean_name:
-                clean_name = raw_name
-            code = GeoFlagResolver.resolve_code(item)
-            proto = pick_first_text(item, ("protocol",), "PROXY").upper()
-            self.profile_combo.addItem(make_flag_qicon(code, 26, 18), f"{clean_name}  [{proto}]")
-
-        if (resolved_idx >= 0) and (resolved_idx < len(self._profiles_list)):
-            self.profile_combo.setCurrentIndex(resolved_idx)
-        else:
-            self.profile_combo.setCurrentIndex(-1)
-        self.profile_combo.blockSignals(False)
-        self._refresh_geo_visuals()
-
-    def _resolve_phase(self, snap: dict) -> tuple[str, bool, bool]:
-        raw_phase = pick_first_text(snap, ("ui_phase",), "").upper()
-        raw_state = pick_first_text(snap, ("state",), "disconnected").lower()
-
-        default_connecting = (raw_phase == "CONNECTING") or (
-            raw_state in ("connecting", "scanning", "probing", "reconnecting", "starting")
-        )
-        default_connected = (raw_phase == "CONNECTED") or (
-            raw_state in ("connected", "active", "online", "protected")
-        )
-
-        is_connecting = get_bool_value(snap, "is_connecting", default_connecting)
-        is_connected = get_bool_value(snap, "is_connected", default_connected)
-
-        if is_connecting:
-            phase = "CONNECTING"
-        elif is_connected:
-            phase = "CONNECTED"
-        elif (raw_phase == "ERROR") or (raw_state in ("error", "failed")):
-            phase = "ERROR"
-        else:
-            phase = "IDLE"
-        return phase, is_connecting, is_connected
-
-    def _set_badge_style(self, text: str, obj_name: str):
-        self.live_pill_lbl.setText(text)
-        if self.live_pill_lbl.objectName() != obj_name:
-            self.live_pill_lbl.setObjectName(obj_name)
-            self.live_pill_lbl.style().unpolish(self.live_pill_lbl)
-            self.live_pill_lbl.style().polish(self.live_pill_lbl)
-
-    def apply_telemetry(self, snap: dict):
-        self._last_snap = dict(snap)
-
-        snap_uid = pick_first_text(snap, ("active_profile_uid",), "")
-        snap_sel_raw = snap.get("selected_index", None)
-        snap_sel_idx = parse_int_value(snap_sel_raw, -1) if (snap_sel_raw is not None) else -1
-        if (snap_sel_idx >= 0) or bool(snap_uid):
-            self.set_selected_profile_silent(snap_sel_idx, snap_uid)
-
-        phase, is_connecting, is_connected = self._resolve_phase(snap)
-        self._ui_phase = phase
-        self._is_connected = is_connected
-
-        btn_text = sanitize_ui_text(pick_first_text(snap, ("button_text",), ""))
-        self.radar_core.set_ui_phase(phase)
-        self.connect_btn.set_phase_and_label(phase, btn_text)
-
-        uptime_label = pick_first_text(snap, ("uptime_label",), "00:00:00")
-        self.chronometer.set_uptime_state(uptime_label, is_connected)
-
-        default_headline = (
-            "در حال یافتن بهترین مسیر..."
-            if is_connecting
-            else ("متصل است" if is_connected else "آماده اتصال")
-        )
-        headline = sanitize_ui_text(pick_first_text(snap, ("status_headline",), default_headline))
-        default_detail = "" if is_connected else "موتور هوشمند آماده برقراری تونل امن است."
-        detail = sanitize_ui_text(pick_first_text(snap, ("status_detail",), default_detail))
-        self.headline_lbl.setText(headline)
-        self.detail_lbl.setText(detail)
-
-        prog = parse_int_value(snap.get("progress_percent", 0), 0)
-        if is_connecting:
-            self.scan_progress.show()
-            self.scan_progress.setValue(max(5, prog))
-            self._set_badge_style("PROBING...", "PhaseProbing")
-        elif is_connected:
-            self.scan_progress.hide()
-            self._set_badge_style("ONLINE", "PhaseOnline")
-        elif phase == "ERROR":
-            self.scan_progress.hide()
-            self._set_badge_style("ERROR", "PhaseError")
-        else:
-            self.scan_progress.hide()
-            self._set_badge_style("STANDBY", "PhaseStandby")
-
-        egress = pick_first_text(snap, ("egress_ip",), "—") if is_connected else "—"
-        self._last_egress_ip = egress if (is_connected and (egress != "—")) else ""
-        self.ip_card.value_lbl.setText(egress)
-
-        rx_kbps = parse_float_value(snap.get("rx_rate_kbps", 0.0), 0.0) if is_connected else 0.0
-        tx_kbps = parse_float_value(snap.get("tx_rate_kbps", 0.0), 0.0) if is_connected else 0.0
-        ping = parse_int_value(snap.get("ping_ms", 0), 0) if is_connected else 0
-        self._last_ping_ms = ping
-
-        rx_label = pick_first_text(snap, ("rx_rate_label",), "")
-        tx_label = pick_first_text(snap, ("tx_rate_label",), "")
-
-        if (not is_connected) or (rx_kbps <= 0.0):
-            rx_display = rx_label if (is_connected and bool(rx_label)) else "0 B/s"
-            self.rx_card.sparkline.reset_flat()
-        else:
-            rx_display = rx_label if rx_label else format_rate_from_kbps(rx_kbps)
-            self.rx_card.sparkline.push_sample(rx_kbps)
-
-        if (not is_connected) or (tx_kbps <= 0.0):
-            tx_display = tx_label if (is_connected and bool(tx_label)) else "0 B/s"
-            self.tx_card.sparkline.reset_flat()
-        else:
-            tx_display = tx_label if tx_label else format_rate_from_kbps(tx_kbps)
-            self.tx_card.sparkline.push_sample(tx_kbps)
-
-        if (not is_connected) or (ping <= 0):
-            self.ping_card.value_lbl.setText("—")
-            self.ping_card.sparkline.reset_flat()
-        else:
-            self.ping_card.value_lbl.setText(f"{ping} ms")
-            self.ping_card.sparkline.push_sample(float(ping))
-
-        self.rx_card.value_lbl.setText(rx_display)
-        self.tx_card.value_lbl.setText(tx_display)
-
-        vec = sanitize_ui_text(pick_first_text(snap, ("active_vector_id",), "AUTO"))
-        self.vector_badge.setText(vec)
-        self._refresh_geo_visuals()
-
-    def set_palette_theme(self, palette: ThemePalette):
-        self._palette = palette
-        self.hero_card.set_palette_theme(palette)
-        self.radar_core.set_palette_theme(palette)
-        self.route_bridge.set_palette_theme(palette)
-        self.connect_btn.set_palette_theme(palette)
-        self.chronometer.set_palette_theme(palette)
-        self.hunt_best_btn.set_palette_theme(palette)
-        self.sys_proxy_switch.set_palette_theme(palette)
-        self.autopilot_switch.set_palette_theme(palette)
-        self.tun_switch.set_palette_theme(palette)
-        for card in (self.ip_card, self.rx_card, self.tx_card, self.ping_card):
-            card.set_palette_theme(palette)
-
-
-class RepoStatCounterCard(QFrame):
-    def __init__(self, caption: str, accent_hex: str, parent=None):
-        super().__init__(parent)
-        self.setObjectName("SubtleCard")
-        self._accent_hex = accent_hex
-
-        row = QHBoxLayout(self)
-        row.setContentsMargins(12, 8, 12, 8)
-        row.setSpacing(8)
-
-        self.caption_lbl = QLabel(caption)
-        self.caption_lbl.setObjectName("MutedLabel")
-
-        self.value_lbl = QLabel("0")
-        enforce_english_ltr(self.value_lbl, mono_size=12, bold=True)
-        self.value_lbl.setStyleSheet(f"color: {accent_hex};")
-
-        row.addWidget(self.caption_lbl)
-        row.addStretch()
-        row.addWidget(self.value_lbl)
-
-    def set_value_text(self, text: str):
-        self.value_lbl.setText(text)
-
-
-class ScanResultRowWidget(QFrame):
-    ip_selected = Signal(str)
-    apply_ip_requested = Signal(str, bool)
-    apply_vector_requested = Signal(str, int, str, bool)
-    apply_vector_all_requested = Signal(str, str)
-    connect_scanned_profile_requested = Signal(int, str, str)
-
-    def __init__(self, row: dict, fallback_target_index: int = -1, parent=None):
-        super().__init__(parent)
-        self._row = dict(row)
-        self._fallback_target_index = fallback_target_index
-        self._ip = ""
-        self._item_id = ""
-        self._target_idx = -1
-        self._endpoint = ""
-        self._bound_vector = ""
-
-        self.setObjectName("GlassCard")
-        self.setMinimumHeight(68)
-
-        self._layout = QHBoxLayout(self)
-        self._layout.setContentsMargins(14, 10, 14, 10)
-        self._layout.setSpacing(8)
-
-        self.rank_badge = QLabel()
-        enforce_english_ltr(self.rank_badge, mono_size=10, bold=True)
-
-        self.flag_badge = FlagBadgeWidget("GLOBAL", width=26, height=17)
-
-        self.cat_badge = QLabel()
-        self.cat_badge.setObjectName("BadgePill")
-        enforce_english_ltr(self.cat_badge, mono_size=10, bold=True)
-
-        info_col = QVBoxLayout()
-        info_col.setSpacing(2)
-        self.title_lbl = QLabel()
-        self.title_lbl.setFont(make_ui_font(10, QFont.Weight.Bold))
-        self.detail_lbl = QLabel()
-        self.detail_lbl.setObjectName("MutedLabel")
-        info_col.addWidget(self.title_lbl)
-        info_col.addWidget(self.detail_lbl)
-
-        self.endpoint_lbl = QLabel()
-        enforce_english_ltr(self.endpoint_lbl, mono_size=10, bold=True)
-
-        self.metrics_lbl = QLabel()
-        enforce_english_ltr(self.metrics_lbl, mono_size=10)
-
-        self.status_badge = QLabel()
-        enforce_english_ltr(self.status_badge, mono_size=10, bold=True)
-
-        self.btn_apply_vec = QPushButton("اعمال روی کانفیگ")
-        self.btn_apply_vec.setObjectName("GhostPillBtn")
-        self.btn_apply_vec.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_apply_vec.clicked.connect(self._on_apply_vec_single)
-
-        self.btn_apply_vec_all = QPushButton("اعمال روی کل مخزن")
-        self.btn_apply_vec_all.setObjectName("AmberPillBtn")
-        self.btn_apply_vec_all.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_apply_vec_all.clicked.connect(self._on_apply_vec_all)
-
-        self.btn_apply_vec_conn = QPushButton("اعمال و اتصال")
-        self.btn_apply_vec_conn.setObjectName("SuccessPillBtn")
-        self.btn_apply_vec_conn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_apply_vec_conn.clicked.connect(self._on_apply_vec_and_connect)
-
-        self.btn_repo_connect = QPushButton("انتخاب و اتصال فوری")
-        self.btn_repo_connect.setObjectName("SuccessPillBtn")
-        self.btn_repo_connect.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_repo_connect.clicked.connect(self._on_repo_connect)
-
-        self.btn_patch_ip_active = QPushButton("وصله به کانفیگ فعلی")
-        self.btn_patch_ip_active.setObjectName("AccentBtn")
-        self.btn_patch_ip_active.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_patch_ip_active.clicked.connect(self._on_patch_ip_active)
-
-        self.btn_patch_ip_all = QPushButton("وصله به کل مخزن")
-        self.btn_patch_ip_all.setObjectName("AmberPillBtn")
-        self.btn_patch_ip_all.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_patch_ip_all.clicked.connect(self._on_patch_ip_all)
-
-        self._layout.addWidget(self.rank_badge)
-        self._layout.addWidget(self.flag_badge)
-        self._layout.addWidget(self.cat_badge)
-        self._layout.addLayout(info_col, 1)
-        self._layout.addWidget(self.endpoint_lbl)
-        self._layout.addWidget(self.metrics_lbl)
-        self._layout.addWidget(self.status_badge)
-        self._layout.addWidget(self.btn_apply_vec)
-        self._layout.addWidget(self.btn_apply_vec_all)
-        self._layout.addWidget(self.btn_apply_vec_conn)
-        self._layout.addWidget(self.btn_repo_connect)
-        self._layout.addWidget(self.btn_patch_ip_active)
-        self._layout.addWidget(self.btn_patch_ip_all)
-
-        self.update_data(row, fallback_target_index)
-
-    def _on_apply_vec_single(self):
-        self.btn_apply_vec.setText("اعمال شد")
-        self.apply_vector_requested.emit(self._item_id, self._target_idx, self._endpoint, False)
-
-    def _on_apply_vec_all(self):
-        self.btn_apply_vec_all.setText("وصله به مخزن شد")
-        self.apply_vector_all_requested.emit(self._item_id, self._endpoint)
-
-    def _on_apply_vec_and_connect(self):
-        self.btn_apply_vec_conn.setText("در حال اتصال...")
-        self.apply_vector_requested.emit(self._item_id, self._target_idx, self._endpoint, True)
-
-    def _on_repo_connect(self):
-        self.btn_repo_connect.setText("در حال اتصال...")
-        self.connect_scanned_profile_requested.emit(self._target_idx, self._bound_vector, self._endpoint)
-
-    def _on_patch_ip_active(self):
-        cand = extract_ip_candidate(self._item_id)
-        target_ip = self._item_id if bool(cand) else self._ip
-        if target_ip:
-            self.btn_patch_ip_active.setText("وصله شد")
-            self.apply_ip_requested.emit(target_ip, True)
-
-    def _on_patch_ip_all(self):
-        cand = extract_ip_candidate(self._item_id)
-        target_ip = self._item_id if bool(cand) else self._ip
-        if target_ip:
-            self.btn_patch_ip_all.setText("وصله به مخزن شد")
-            self.apply_ip_requested.emit(target_ip, False)
-
-    def _resolve_profile_index(self, row: dict) -> int:
-        for k in ("target_index", "profile_index", "index"):
-            v = row.get(k, None)
-            if isinstance(v, int) and (not isinstance(v, bool)) and (v >= 0):
-                return v
-            if isinstance(v, str) and v.isdigit():
-                return int(v)
-        m = re.search(r"(\d+)", pick_first_text(row, ("item_id",), ""))
-        if m:
-            return int(m.group(1))
-        return self._fallback_target_index
-
-    def update_data(self, row: dict, fallback_target_index: int = -1):
-        self._row = dict(row)
-        if fallback_target_index >= 0:
-            self._fallback_target_index = fallback_target_index
-
-        scan_type = pick_first_text(row, ("scan_type",), "").lower()
-        self._item_id = pick_first_text(row, ("item_id",), "")
-        self._endpoint = pick_first_text(row, ("endpoint",), "")
-        self._bound_vector = pick_first_text(row, ("bound_vector", "vector_id"), "")
-        self._target_idx = self._resolve_profile_index(row)
-
-        self.flag_badge.set_country_code(GeoFlagResolver.resolve_code(row))
-
-        rank_str = normalize_rank_text(row.get("rank", None))
-        if rank_str:
-            self.rank_badge.setText(rank_str)
-            if rank_str == "#1":
-                r_obj = "RankGold"
-                self.setObjectName("HeroCard")
-            elif rank_str == "#2":
-                r_obj = "RankSilver"
-            elif rank_str == "#3":
-                r_obj = "RankBronze"
-            else:
-                r_obj = "RankDefault"
-            self.rank_badge.setObjectName(r_obj)
-            self.rank_badge.style().unpolish(self.rank_badge)
-            self.rank_badge.style().polish(self.rank_badge)
-            self.style().unpolish(self)
-            self.style().polish(self)
-            self.rank_badge.show()
-        else:
-            self.rank_badge.hide()
-
-        raw_title = sanitize_ui_text(pick_first_text(row, ("title", "item_id"), "Result"))
-        clean_title = GeoFlagResolver.clean_display_name(raw_title)
-        if not clean_title:
-            clean_title = raw_title
-        default_cat = scan_type.upper() if scan_type else "SCAN"
-        category = sanitize_ui_text(pick_first_text(row, ("category",), default_cat))
-        tcp_ms = row.get("tcp_ms", None)
-        tunnel_ms = row.get("tunnel_ms", None)
-        score = row.get("score", None)
-        status = pick_first_text(row, ("status",), "UNTESTED").upper()
-        detail = sanitize_ui_text(pick_first_text(row, ("detail",), "ارزیابی کامل شد"))
-
-        self.cat_badge.setText(category[:16])
-        self.title_lbl.setText(clean_title)
-        self.detail_lbl.setText(detail)
-        self.endpoint_lbl.setText(self._endpoint)
-
-        parts = []
-        if (score is not None) and (str(score).strip() != ""):
-            parts.append(f"Score {parse_float_value(score, 0.0):.0f}")
-        tcp_int = parse_int_value(tcp_ms, 0)
-        if tcp_int > 0:
-            parts.append(f"TCP {tcp_int}ms")
-        tls_int = parse_int_value(tunnel_ms, 0)
-        if tls_int > 0:
-            parts.append(f"TLS {tls_int}ms")
-        self.metrics_lbl.setText(" | ".join(parts) if parts else "—")
-
-        self.status_badge.setText(status)
-        if status in ("VERIFIED", "OK", "PASS", "CLEAN", "HEALTHY", "ONLINE"):
-            self.status_badge.setObjectName("StatusVerified")
-        elif status in ("PARTIAL_OK", "PARTIAL", "WARN"):
-            self.status_badge.setObjectName("StatusPartial")
-        elif status in ("DEAD", "FAIL", "FAILED", "TIMEOUT", "BLOCKED", "ERROR"):
-            self.status_badge.setObjectName("StatusDead")
-        else:
-            self.status_badge.setObjectName("StatusUntested")
-        self.status_badge.style().unpolish(self.status_badge)
-        self.status_badge.style().polish(self.status_badge)
-
-        is_vector_type = scan_type in ("vector", "active_profile")
-        is_repo_type = scan_type in ("repository", "full_repository")
-        is_ip_type = scan_type in ("clean_ip", "clean_ip_radar")
-
-        is_method_ok = is_vector_type and (status in ("VERIFIED", "PARTIAL_OK"))
-        self.btn_apply_vec.setVisible(is_method_ok)
-        self.btn_apply_vec_all.setVisible(is_method_ok)
-        self.btn_apply_vec_conn.setVisible(is_method_ok)
-
-        is_repo_ok = is_repo_type and (
-            status in ("VERIFIED", "PARTIAL_OK", "OK", "CLEAN", "HEALTHY")
-        )
-        self.btn_repo_connect.setVisible(is_repo_ok)
-
-        ip_cand = extract_ip_candidate(self._item_id)
-        if not ip_cand:
-            ip_cand = extract_ip_candidate(self._endpoint)
-        if not ip_cand:
-            ip_cand = extract_ip_candidate(raw_title)
-        self._ip = ip_cand
-        show_ip_btns = is_ip_type and bool(ip_cand)
-        self.btn_patch_ip_active.setVisible(show_ip_btns)
-        self.btn_patch_ip_all.setVisible(show_ip_btns)
-
-    def mouseReleaseEvent(self, event):
-        if (event.button() == Qt.MouseButton.LeftButton) and bool(self._ip):
-            self.ip_selected.emit(self._ip)
-        super().mouseReleaseEvent(event)
-
-
-class ScannerPage(QWidget):
-    start_scan_requested = Signal(str, int, dict)
-    stop_scan_requested = Signal()
-    apply_ip_requested = Signal(str, bool)
-    apply_vector_requested = Signal(str, int, str, bool)
-    apply_vector_all_requested = Signal(str, str)
-    connect_scanned_profile_requested = Signal(int, str, str)
-
-    MODES = ["active_profile", "full_repository", "clean_ip_radar"]
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._palette: ThemePalette = DARK_PALETTE
-        self._is_running = False
-        self._selected_ip = ""
-        self._total_profiles_count = 0
-        self._current_target_index = -1
-        self._repo_verified_ids: set[str] = set()
-        self._repo_dead_ids: set[str] = set()
-        self._row_widgets: dict[str, ScanResultRowWidget] = {}
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(20, 12, 20, 16)
-        root.setSpacing(10)
-
-        hdr = QHBoxLayout()
-        t_col = QVBoxLayout()
-        t_lbl = QLabel("اسکنر هوشمند، رتبه‌بندی متدها و رادار IP تمیز")
-        t_lbl.setFont(make_ui_font(15, QFont.Weight.ExtraBold))
-        s_lbl = QLabel("رتبه‌بندی خودکار متدهای عبوری، وصله مستقیم به تک‌کانفیگ یا کل مخزن و پایش دسته‌جمعی.")
-        s_lbl.setObjectName("MutedLabel")
-        t_col.addWidget(t_lbl)
-        t_col.addWidget(s_lbl)
-        hdr.addLayout(t_col, 1)
-        root.addLayout(hdr)
-
-        self.inline_task_strip = TaskProgressStrip(inline_style=True)
-        self.inline_task_strip.stop_requested.connect(self.stop_scan_requested.emit)
-        root.addWidget(self.inline_task_strip)
-
-        self.mode_bar = SegmentedCapsuleBar(
-            [
-                "اسکن عمیق کانفیگ انتخابی",
-                "اسکن دسته‌جمعی کل مخزن",
-                "رادار چندرنجی IP تمیز",
-            ]
-        )
-        self.mode_bar.current_changed.connect(self._on_mode_changed)
-        root.addWidget(self.mode_bar)
-
-        self.options_card = QFrame()
-        self.options_card.setObjectName("PillBar")
-        opt_layout = QHBoxLayout(self.options_card)
-        opt_layout.setContentsMargins(14, 10, 14, 10)
-        opt_layout.setSpacing(12)
-
-        self.mode0_widget = QWidget()
-        m0 = QHBoxLayout(self.mode0_widget)
-        m0.setContentsMargins(0, 0, 0, 0)
-        m0.setSpacing(12)
-        m0_lbl = QLabel("کانفیگ هدف:")
-        m0_lbl.setObjectName("SecondaryLabel")
-        self.target_profile_combo = QComboBox()
-        self.target_profile_combo.setMinimumWidth(240)
-        self.target_profile_combo.setIconSize(QSize(24, 16))
-        self.chk_auto_connect = QCheckBox("اتصال خودکار به اولین متد موفق")
-        self.chk_auto_connect.setChecked(False)
-        m0.addWidget(m0_lbl)
-        m0.addWidget(self.target_profile_combo, 1)
-        m0.addSpacing(10)
-        m0.addWidget(self.chk_auto_connect)
-        m0.addStretch()
-
-        self.mode1_widget = QWidget()
-        m1 = QHBoxLayout(self.mode1_widget)
-        m1.setContentsMargins(0, 0, 0, 0)
-        m1.setSpacing(12)
-        self.sw_repo_clean_ip = AnimatedToggleSwitch(checked=True)
-        m1_lbl1 = QLabel("تزریق خودکار IP تمیز روی کانفیگ‌ها")
-        m1_lbl1.setObjectName("SecondaryLabel")
-        self.sw_repo_prune = AnimatedToggleSwitch(checked=False)
-        m1_lbl2 = QLabel("حذف خودکار کانفیگ‌های ازکارافتاده")
-        m1_lbl2.setObjectName("SecondaryLabel")
-        m1.addWidget(self.sw_repo_clean_ip)
-        m1.addWidget(m1_lbl1)
-        m1.addSpacing(14)
-        m1.addWidget(self.sw_repo_prune)
-        m1.addWidget(m1_lbl2)
-        m1.addStretch()
-        self.mode1_widget.hide()
-
-        self.mode2_widget = QWidget()
-        m2 = QHBoxLayout(self.mode2_widget)
-        m2.setContentsMargins(0, 0, 0, 0)
-        m2.setSpacing(10)
-        port_lbl = QLabel("پورت TLS:")
-        port_lbl.setObjectName("SecondaryLabel")
-        self.radar_port_spin = QSpinBox()
-        self.radar_port_spin.setRange(1, 65535)
-        self.radar_port_spin.setValue(443)
-        enforce_english_ltr(self.radar_port_spin, mono_size=10)
-
-        samp_lbl = QLabel("تعداد نمونه:")
-        samp_lbl.setObjectName("SecondaryLabel")
-        self.radar_samples_spin = QSpinBox()
-        self.radar_samples_spin.setRange(4, 500)
-        self.radar_samples_spin.setValue(44)
-        enforce_english_ltr(self.radar_samples_spin, mono_size=10)
-
-        self.selected_ip_badge = QLabel("IP: —")
-        self.selected_ip_badge.setObjectName("BadgePill")
-        enforce_english_ltr(self.selected_ip_badge, mono_size=10, bold=True)
-
-        self.top_apply_active_btn = QPushButton("وصله به کانفیگ فعلی")
-        self.top_apply_active_btn.setObjectName("GhostPillBtn")
-        self.top_apply_active_btn.setEnabled(False)
-        self.top_apply_active_btn.clicked.connect(lambda: self._apply_selected_ip(True))
-
-        self.top_apply_repo_btn = QPushButton("وصله به کل مخزن")
-        self.top_apply_repo_btn.setObjectName("GhostPillBtn")
-        self.top_apply_repo_btn.setEnabled(False)
-        self.top_apply_repo_btn.clicked.connect(lambda: self._apply_selected_ip(False))
-
-        m2.addWidget(port_lbl)
-        m2.addWidget(self.radar_port_spin)
-        m2.addWidget(samp_lbl)
-        m2.addWidget(self.radar_samples_spin)
-        m2.addStretch()
-        m2.addWidget(self.selected_ip_badge)
-        m2.addWidget(self.top_apply_active_btn)
-        m2.addWidget(self.top_apply_repo_btn)
-        self.mode2_widget.hide()
-
-        opt_layout.addWidget(self.mode0_widget, 1)
-        opt_layout.addWidget(self.mode1_widget, 1)
-        opt_layout.addWidget(self.mode2_widget, 1)
-        root.addWidget(self.options_card)
-
-        ctrl_bar = QFrame()
-        ctrl_bar.setObjectName("PillBar")
-        ctrl_layout = QHBoxLayout(ctrl_bar)
-        ctrl_layout.setContentsMargins(14, 9, 14, 9)
-        ctrl_layout.setSpacing(12)
-
-        self.action_btn = QPushButton("شروع اسکن")
-        self.action_btn.setObjectName("AccentBtn")
-        self.action_btn.setMinimumWidth(135)
-        self.action_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.action_btn.clicked.connect(self._toggle_scan)
-
-        self.clear_btn = QPushButton("پاکسازی نتایج")
-        self.clear_btn.setObjectName("GhostPillBtn")
-        self.clear_btn.clicked.connect(self.clear_results)
-
-        prog_col = QVBoxLayout()
-        prog_col.setSpacing(4)
-        self.status_lbl = QLabel("آماده شروع عملیات اسکن")
-        self.status_lbl.setObjectName("SecondaryLabel")
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setObjectName("GoldProgress")
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(False)
-        enforce_english_ltr(self.progress_bar, mono_size=9)
-        prog_col.addWidget(self.status_lbl)
-        prog_col.addWidget(self.progress_bar)
-
-        self.percent_badge = QLabel("0%")
-        self.percent_badge.setObjectName("BadgePill")
-        enforce_english_ltr(self.percent_badge, mono_size=10, bold=True)
-
-        ctrl_layout.addWidget(self.action_btn)
-        ctrl_layout.addWidget(self.clear_btn)
-        ctrl_layout.addLayout(prog_col, 1)
-        ctrl_layout.addWidget(self.percent_badge)
-        root.addWidget(ctrl_bar)
-
-        self.repo_stats_bar = QWidget()
-        stats_row = QHBoxLayout(self.repo_stats_bar)
-        stats_row.setContentsMargins(0, 0, 0, 0)
-        stats_row.setSpacing(10)
-
-        self.stat_total = RepoStatCounterCard("کل کانفیگ‌ها", "#38BDF8")
-        self.stat_verified = RepoStatCounterCard("تاییدشده (سالم)", "#10B981")
-        self.stat_dead = RepoStatCounterCard("ازکارافتاده (خطا)", "#EF4444")
-        self.stat_progress = RepoStatCounterCard("پیشرفت", "#FFD000")
-
-        stats_row.addWidget(self.stat_total, 1)
-        stats_row.addWidget(self.stat_verified, 1)
-        stats_row.addWidget(self.stat_dead, 1)
-        stats_row.addWidget(self.stat_progress, 1)
-        self.repo_stats_bar.hide()
-        root.addWidget(self.repo_stats_bar)
-
-        self.rows_container = QWidget()
-        self.rows_layout = QVBoxLayout(self.rows_container)
-        self.rows_layout.setContentsMargins(0, 4, 4, 6)
-        self.rows_layout.setSpacing(8)
-        self.empty_lbl = QLabel("نتایج اسکن زنده و رتبه‌بندی نهایی در این بخش نمایش داده می‌شوند.")
-        self.empty_lbl.setObjectName("MutedLabel")
-        self.empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.rows_layout.addWidget(self.empty_lbl)
-        self.rows_layout.addStretch()
-
-        self.scroll = make_transparent_scroll_area(self.rows_container)
-        root.addWidget(self.scroll, 1)
-
-    def _on_mode_changed(self, idx: int):
-        self.mode0_widget.setVisible(idx == 0)
-        self.mode1_widget.setVisible(idx == 1)
-        self.mode2_widget.setVisible(idx == 2)
-        self.repo_stats_bar.setVisible(idx == 1)
-        self._refresh_repo_counters()
-
-    def set_profiles(self, items: list[dict], active_index: int = -1, active_uid: str = ""):
-        safe_items = list(items) if isinstance(items, list) else []
-        self._total_profiles_count = len(safe_items)
-        prev = self.target_profile_combo.currentIndex()
-        resolved_active = resolve_active_profile_index(safe_items, active_index, active_uid)
-
-        self.target_profile_combo.blockSignals(True)
-        self.target_profile_combo.clear()
-        for idx, item in enumerate(safe_items):
-            raw_name = sanitize_ui_text(pick_first_text(item, ("name", "title"), f"Profile #{idx + 1}"))
-            clean_name = GeoFlagResolver.clean_display_name(raw_name)
-            if not clean_name:
-                clean_name = raw_name
-            code = GeoFlagResolver.resolve_code(item)
-            proto = pick_first_text(item, ("protocol",), "PROXY").upper()
-            self.target_profile_combo.addItem(
-                make_flag_qicon(code, 26, 18),
-                f"#{idx + 1} - {clean_name} ({proto})",
-            )
-
-        chosen = resolved_active if (resolved_active >= 0) else prev
-        if (chosen >= 0) and (chosen < len(safe_items)):
-            self.target_profile_combo.setCurrentIndex(chosen)
-        elif safe_items:
-            self.target_profile_combo.setCurrentIndex(0)
-        else:
-            self.target_profile_combo.setCurrentIndex(-1)
-        self.target_profile_combo.blockSignals(False)
-        self._refresh_repo_counters()
-
-    def trigger_profile_deep_scan(self, index: int):
-        self.mode_bar.set_current_index(0, emit_signal=True)
-        if (index >= 0) and (index < self.target_profile_combo.count()):
-            self.target_profile_combo.setCurrentIndex(index)
-        self._current_target_index = index
-        self.clear_results()
-        self.start_scan_requested.emit(
-            "active_profile",
-            index,
-            {"auto_connect": self.chk_auto_connect.isChecked()},
-        )
-
-    def _toggle_scan(self):
-        if self._is_running:
-            self.stop_scan_requested.emit()
-            return
-
-        self.clear_results()
-        idx = self.mode_bar.current_index()
-        mode = self.MODES[idx]
-        if mode == "active_profile":
-            target = max(0, self.target_profile_combo.currentIndex())
-            self._current_target_index = target
-            opts = {"auto_connect": self.chk_auto_connect.isChecked()}
-        elif mode == "full_repository":
-            target = -1
-            self._current_target_index = -1
-            opts = {
-                "prune_dead": self.sw_repo_prune.isChecked(),
-                "auto_clean_ip": self.sw_repo_clean_ip.isChecked(),
-            }
-        else:
-            target = -1
-            self._current_target_index = -1
-            opts = {
-                "port": int(self.radar_port_spin.value()),
-                "samples": int(self.radar_samples_spin.value()),
-            }
-        self.start_scan_requested.emit(mode, target, opts)
-
-    def _refresh_repo_counters(self):
-        self.stat_total.set_value_text(str(self._total_profiles_count))
-        self.stat_verified.set_value_text(str(len(self._repo_verified_ids)))
-        self.stat_dead.set_value_text(str(len(self._repo_dead_ids)))
-        self.stat_progress.set_value_text(f"{self.progress_bar.value()}%")
-
-    def clear_results(self):
-        self.rows_container.setUpdatesEnabled(False)
-        try:
-            self._row_widgets.clear()
-            self._repo_verified_ids.clear()
-            self._repo_dead_ids.clear()
-            self.progress_bar.setValue(0)
-            self.percent_badge.setText("0%")
-            self._refresh_repo_counters()
-
-            while self.rows_layout.count():
-                item = self.rows_layout.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
-            self.empty_lbl = QLabel("نتایج اسکن زنده و رتبه‌بندی نهایی در این بخش نمایش داده می‌شوند.")
-            self.empty_lbl.setObjectName("MutedLabel")
-            self.empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.rows_layout.addWidget(self.empty_lbl)
-            self.rows_layout.addStretch()
-        finally:
-            self.rows_container.setUpdatesEnabled(True)
-
-    def _on_ip_selected(self, ip: str):
-        self._selected_ip = ip
-        self.selected_ip_badge.setText(f"IP: {ip}")
-        self.top_apply_active_btn.setEnabled(bool(ip))
-        self.top_apply_repo_btn.setEnabled(bool(ip))
-
-    def _apply_selected_ip(self, only_active: bool):
-        if self._selected_ip:
-            self.apply_ip_requested.emit(self._selected_ip, only_active)
-
-    def _create_row_widget(self, row: dict) -> ScanResultRowWidget:
-        widget = ScanResultRowWidget(row, fallback_target_index=self._current_target_index)
-        widget.ip_selected.connect(self._on_ip_selected)
-        widget.apply_ip_requested.connect(self.apply_ip_requested.emit)
-        widget.apply_vector_requested.connect(self.apply_vector_requested.emit)
-        widget.apply_vector_all_requested.connect(self.apply_vector_all_requested.emit)
-        widget.connect_scanned_profile_requested.connect(self.connect_scanned_profile_requested.emit)
-        return widget
-
-    def _track_repo_row_stats(self, row: dict):
-        scan_t = pick_first_text(row, ("scan_type",), "").lower()
-        if scan_t not in ("repository", "full_repository"):
-            return
-        key = pick_first_text(row, ("item_id",), str(id(row)))
-        status = pick_first_text(row, ("status",), "").upper()
-        if status in ("VERIFIED", "PARTIAL_OK", "OK", "CLEAN", "HEALTHY"):
-            self._repo_verified_ids.add(key)
-            self._repo_dead_ids.discard(key)
-        elif status in ("DEAD", "FAIL", "FAILED", "TIMEOUT", "BLOCKED", "ERROR"):
-            self._repo_dead_ids.add(key)
-            self._repo_verified_ids.discard(key)
-        self._refresh_repo_counters()
-
-    def append_or_update_row(self, row: dict):
-        self.rows_container.setUpdatesEnabled(False)
-        try:
-            if self.empty_lbl is not None:
-                self.empty_lbl.hide()
-
-            self._track_repo_row_stats(row)
-
-            key = pick_first_text(row, ("item_id",), "")
-            if key and (key in self._row_widgets):
-                self._row_widgets[key].update_data(row, fallback_target_index=self._current_target_index)
-            else:
-                widget = self._create_row_widget(row)
-                insert_pos = max(0, self.rows_layout.count() - 1)
-                self.rows_layout.insertWidget(insert_pos, widget)
-                if key:
-                    self._row_widgets[key] = widget
-
-            scan_t = pick_first_text(row, ("scan_type",), "").lower()
-            if (scan_t in ("clean_ip", "clean_ip_radar")) and (not self._selected_ip):
-                cand = extract_ip_candidate(pick_first_text(row, ("item_id", "endpoint"), ""))
-                if cand:
-                    self._on_ip_selected(cand)
-        finally:
-            self.rows_container.setUpdatesEnabled(True)
-
-    def apply_ranked_results(self, rows: list):
-        if not rows:
-            return
-        self.rows_container.setUpdatesEnabled(False)
-        try:
-            self._row_widgets.clear()
-            self._repo_verified_ids.clear()
-            self._repo_dead_ids.clear()
-
-            while self.rows_layout.count():
-                item = self.rows_layout.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
-            self.empty_lbl = None
-
-            for idx, raw_row in enumerate(rows):
-                if not isinstance(raw_row, dict):
-                    continue
-                r_copy = dict(raw_row)
-                if not r_copy.get("rank"):
-                    r_copy["rank"] = f"#{idx + 1}"
-                if ("target_index" not in r_copy) and (self._current_target_index >= 0):
-                    r_copy["target_index"] = self._current_target_index
-
-                self._track_repo_row_stats(r_copy)
-                widget = self._create_row_widget(r_copy)
-                self.rows_layout.addWidget(widget)
-                key = pick_first_text(r_copy, ("item_id",), "")
-                if key:
-                    self._row_widgets[key] = widget
-
-            self.rows_layout.addStretch()
-            self._refresh_repo_counters()
-        finally:
-            self.rows_container.setUpdatesEnabled(True)
-
-    def show_confirmation(self, message: str):
-        self.status_lbl.setText(sanitize_ui_text(message))
-
-    def update_progress(self, percent: int, label: str):
-        clamped = max(0, min(100, parse_int_value(percent, 0)))
-        self.progress_bar.setValue(clamped)
-        self.percent_badge.setText(f"{clamped}%")
-        if label:
-            self.status_lbl.setText(sanitize_ui_text(label))
-        self._refresh_repo_counters()
-
-    def update_scan_state(self, is_running: bool, summary: str):
-        self._is_running = bool(is_running)
-        if self._is_running:
-            self.action_btn.setText("توقف اسکن")
-            self.action_btn.setObjectName("DangerSolidBtn")
-        else:
-            self.action_btn.setText("شروع اسکن")
-            self.action_btn.setObjectName("AccentBtn")
-        self.action_btn.style().unpolish(self.action_btn)
-        self.action_btn.style().polish(self.action_btn)
-        if summary:
-            self.status_lbl.setText(sanitize_ui_text(summary))
-
-    def set_palette_theme(self, palette: ThemePalette):
-        self._palette = palette
-        self.inline_task_strip.set_palette_theme(palette)
-        self.mode_bar.set_palette_theme(palette)
-        for sw in (self.sw_repo_clean_ip, self.sw_repo_prune):
-            sw.set_palette_theme(palette)
-
-
-class ProfileCardWidget(QFrame):
-    selected = Signal(int)
-    deleted = Signal(int)
-    full_edit_requested = Signal(int)
-    rename_requested = Signal(int, str)
-    clone_clean_requested = Signal(int)
-    send_to_scanner_requested = Signal(int)
-    copied_uri = Signal(str)
-
-    def __init__(self, index: int, data: dict, is_active: bool, palette: ThemePalette, parent=None):
-        super().__init__(parent)
-        self._index = index
-        self._data = data
-        self.setObjectName("HeroCard" if is_active else "GlassCard")
-        self.setMinimumHeight(82)
-
-        row = QHBoxLayout(self)
-        row.setContentsMargins(14, 10, 14, 10)
-        row.setSpacing(9)
-
-        country_code = GeoFlagResolver.resolve_code(data)
-        flag_widget = FlagBadgeWidget(country_code, width=32, height=21)
-
-        proto = pick_first_text(data, ("protocol", "scheme"), "VLESS").upper()
-        proto_badge = QLabel(proto)
-        proto_badge.setObjectName("BadgePill")
-        enforce_english_ltr(proto_badge, mono_size=10, bold=True)
-
-        info_col = QVBoxLayout()
-        info_col.setSpacing(3)
-        raw_name = sanitize_ui_text(pick_first_text(data, ("name", "title"), f"Profile #{index + 1}"))
-        clean_name = GeoFlagResolver.clean_display_name(raw_name)
-        if not clean_name:
-            clean_name = raw_name
-        title_lbl = QLabel(clean_name)
-        title_lbl.setFont(make_ui_font(10, QFont.Weight.Bold))
-
-        server_addr = str(data.get("host") or data.get("original_host") or "").strip()
-        if not server_addr:
-            server_addr = pick_first_text(data, ("address", "endpoint"), "—")
-        port_num = parse_int_value(data.get("port", 0), 0)
-        sni = pick_first_text(data, ("sni", "server_name"), "")
-        if (port_num > 0) and (server_addr != "—") and (":" not in server_addr):
-            host_part = f"{server_addr}:{port_num}"
-        else:
-            host_part = server_addr
-        sub_txt = f"{host_part} | SNI: {sni}" if sni else host_part
-        sub_lbl = QLabel(sub_txt)
-        sub_lbl.setObjectName("MutedLabel")
-        enforce_english_ltr(sub_lbl, mono_size=9)
-        sub_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-
-        info_col.addWidget(title_lbl)
-        info_col.addWidget(sub_lbl)
-
-        status_raw = pick_first_text(data, ("status", "health"), "UNTESTED").upper()
-        health_lbl = QLabel(status_raw)
-        enforce_english_ltr(health_lbl, mono_size=9, bold=True)
-        if status_raw in ("VERIFIED", "OK", "HEALTHY", "CLEAN"):
-            health_lbl.setObjectName("StatusVerified")
-        elif status_raw in ("PARTIAL_OK", "PARTIAL"):
-            health_lbl.setObjectName("StatusPartial")
-        elif status_raw in ("DEAD", "FAIL", "FAILED", "TIMEOUT"):
-            health_lbl.setObjectName("StatusDead")
-        else:
-            health_lbl.setObjectName("StatusUntested")
-
-        raw_ping = data.get("ping_ms", None)
-        if raw_ping is None:
-            raw_ping = data.get("latency_ms", 0)
-        ping_int = parse_int_value(raw_ping, 0)
-        ping_txt = f"{ping_int} ms" if (ping_int > 0) else "— ms"
-        ping_lbl = QLabel(ping_txt)
-        ping_lbl.setObjectName("BadgePill")
-        enforce_english_ltr(ping_lbl, mono_size=10, bold=True)
-
-        bound_vec = sanitize_ui_text(
-            pick_first_text(data, ("preferred_vector_id", "cached_vector_id"), "AUTO")
-        )
-        vec_lbl = QLabel(bound_vec if bound_vec else "AUTO")
-        vec_lbl.setObjectName("BadgePill")
-        enforce_english_ltr(vec_lbl, mono_size=9, bold=True)
-
-        full_edit_btn = QPushButton("ویرایش کامل")
-        full_edit_btn.setObjectName("GhostPillBtn")
-        full_edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        full_edit_btn.clicked.connect(lambda: self.full_edit_requested.emit(self._index))
-
-        clone_btn = QPushButton("کلون IP تمیز")
-        clone_btn.setObjectName("GhostPillBtn")
-        clone_btn.setToolTip("تولید ۳ کلون با IPهای تمیز")
-        clone_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        clone_btn.clicked.connect(lambda: self.clone_clean_requested.emit(self._index))
-
-        scan_btn = QPushButton("ارسال به اسکنر")
-        scan_btn.setObjectName("GhostPillBtn")
-        scan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        scan_btn.clicked.connect(lambda: self.send_to_scanner_requested.emit(self._index))
-
-        select_btn = QPushButton("فعال" if is_active else "انتخاب")
-        select_btn.setObjectName("GhostPillBtn" if is_active else "AccentBtn")
-        select_btn.setEnabled(not is_active)
-        select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        select_btn.clicked.connect(lambda: self.selected.emit(self._index))
-
-        rename_btn = VectorIconButton("edit", size=30)
-        rename_btn.setToolTip("تغییر نام سریع")
-        rename_btn.set_palette_theme(palette)
-        rename_btn.clicked.connect(lambda: self.rename_requested.emit(self._index, raw_name))
-
-        copy_btn = VectorIconButton("copy", size=30)
-        copy_btn.setToolTip("کپی لینک کانفیگ")
-        copy_btn.set_palette_theme(palette)
-        copy_btn.clicked.connect(self._copy_single)
-
-        del_btn = VectorIconButton("trash", size=30, danger_hover=True)
-        del_btn.setToolTip("حذف کانفیگ")
-        del_btn.set_palette_theme(palette)
-        del_btn.clicked.connect(lambda: self.deleted.emit(self._index))
-
-        row.addWidget(flag_widget)
-        row.addWidget(proto_badge)
-        row.addLayout(info_col, 1)
-        row.addWidget(vec_lbl)
-        row.addWidget(ping_lbl)
-        row.addWidget(health_lbl)
-        row.addWidget(full_edit_btn)
-        row.addWidget(clone_btn)
-        row.addWidget(scan_btn)
-        row.addWidget(select_btn)
-        row.addWidget(rename_btn)
-        row.addWidget(copy_btn)
-        row.addWidget(del_btn)
-
-    def _copy_single(self):
-        uri = pick_first_text(self._data, ("raw_uri", "uri", "raw"), "")
-        if uri:
-            QGuiApplication.clipboard().setText(uri)
-            self.copied_uri.emit("لینک کانفیگ در کلیپ‌بورد کپی شد.")
-
-
-class ProfilesPage(QWidget):
-    import_clipboard_requested = Signal(str)
-    import_file_requested = Signal(str)
-    open_config_editor_requested = Signal(int)
-    hunt_best_requested = Signal()
-    stop_task_requested = Signal()
-    clear_all_requested = Signal()
-    quick_ping_requested = Signal()
-    sort_requested = Signal(str)
-    deduplicate_requested = Signal()
-    remove_dead_requested = Signal()
-    rename_requested = Signal(int, str)
-    select_requested = Signal(int)
-    delete_requested = Signal(int)
-    clone_clean_requested = Signal(int, int)
-    send_to_scanner_requested = Signal(int)
-    export_requested = Signal(str, int)
-    add_sub_requested = Signal(str, str)
-    refresh_subs_requested = Signal()
-    delete_sub_requested = Signal(int)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._palette: ThemePalette = DARK_PALETTE
-        self._items: list[dict] = []
-        self._subs: list[dict] = []
-        self._active_idx = -1
-        self._active_uid = ""
-        self._filter_query = ""
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(20, 12, 20, 16)
-        root.setSpacing(10)
-
-        header = QHBoxLayout()
-        header.setSpacing(10)
-        title_col = QVBoxLayout()
-        h_lbl = QLabel("مخزن حرفه‌ای پروفایل‌ها و ویرایشگر کانفیگ")
-        h_lbl.setFont(make_ui_font(15, QFont.Weight.ExtraBold))
-        self.feedback_lbl = QLabel("شکار خودکار برترین کانفیگ، ویرایش کامل پارامترها و مدیریت سابسکریپشن.")
-        self.feedback_lbl.setObjectName("MutedLabel")
-        title_col.addWidget(h_lbl)
-        title_col.addWidget(self.feedback_lbl)
-
-        self.hunt_best_btn = ActionIconPillButton(
-            "hunter",
-            "شکار برترین کانفیگ مخزن و اتصال",
-            golden=True,
-        )
-        self.hunt_best_btn.clicked.connect(self.hunt_best_requested.emit)
-
-        self.count_badge = QLabel("0 ITEMS")
-        self.count_badge.setObjectName("BadgePill")
-        enforce_english_ltr(self.count_badge, mono_size=10, bold=True)
-
-        header.addLayout(title_col, 1)
-        header.addWidget(self.hunt_best_btn)
-        header.addWidget(self.count_badge)
-        root.addLayout(header)
-
-        self.inline_task_strip = TaskProgressStrip(inline_style=True)
-        self.inline_task_strip.stop_requested.connect(self.stop_task_requested.emit)
-        root.addWidget(self.inline_task_strip)
-
-        row1 = QFrame()
-        row1.setObjectName("PillBar")
-        r1 = QHBoxLayout(row1)
-        r1.setContentsMargins(12, 8, 12, 8)
-        r1.setSpacing(8)
-
-        btn_new_manual = QPushButton("افزودن دستی کانفیگ جدید")
-        btn_new_manual.setObjectName("AccentBtn")
-        btn_new_manual.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_new_manual.clicked.connect(lambda: self.open_config_editor_requested.emit(-1))
-
-        btn_paste = QPushButton("افزودن از کلیپ‌بورد")
-        btn_paste.setObjectName("GhostPillBtn")
-        btn_paste.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_paste.clicked.connect(self._on_paste_clicked)
-
-        btn_file = QPushButton("واردسازی از فایل")
-        btn_file.setObjectName("GhostPillBtn")
-        btn_file.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_file.clicked.connect(self._on_import_file_clicked)
-
-        self.btn_toggle_subs = QPushButton("مدیریت لینک‌های سابسکریپشن")
-        self.btn_toggle_subs.setObjectName("GhostPillBtn")
-        self.btn_toggle_subs.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_toggle_subs.clicked.connect(self._toggle_subs_drawer)
-
-        btn_export = QPushButton("خروجی سالم‌ها با EarlyData")
-        btn_export.setObjectName("GhostPillBtn")
-        btn_export.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_export.clicked.connect(lambda: self.export_requested.emit("verified", 2048))
-
-        btn_clear_all = QPushButton("حذف کل کانفیگ‌ها")
-        btn_clear_all.setObjectName("DangerSolidBtn")
-        btn_clear_all.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_clear_all.clicked.connect(self._confirm_clear_all)
-
-        r1.addWidget(btn_new_manual)
-        r1.addWidget(btn_paste)
-        r1.addWidget(btn_file)
-        r1.addWidget(self.btn_toggle_subs)
-        r1.addStretch()
-        r1.addWidget(btn_export)
-        r1.addWidget(btn_clear_all)
-        root.addWidget(row1)
-
-        self.subs_drawer = QFrame()
-        self.subs_drawer.setObjectName("HeroCard")
-        subs_vbox = QVBoxLayout(self.subs_drawer)
-        subs_vbox.setContentsMargins(14, 12, 14, 12)
-        subs_vbox.setSpacing(10)
-
-        sub_top = QHBoxLayout()
-        sub_top.setSpacing(8)
-        self.sub_title_edit = QLineEdit()
-        self.sub_title_edit.setPlaceholderText("عنوان سابسکریپشن (مثلاً VIP)")
-        self.sub_title_edit.setMaximumWidth(200)
-
-        self.sub_url_edit = QLineEdit()
-        self.sub_url_edit.setPlaceholderText("https://example.com/sub/token")
-        enforce_english_ltr(self.sub_url_edit, mono_size=10)
-
-        btn_add_sub = QPushButton("افزودن لینک")
-        btn_add_sub.setObjectName("AccentBtn")
-        btn_add_sub.clicked.connect(self._submit_subscription)
-
-        btn_refresh_subs = QPushButton("بروزرسانی همه")
-        btn_refresh_subs.setObjectName("GhostPillBtn")
-        btn_refresh_subs.clicked.connect(self.refresh_subs_requested.emit)
-
-        sub_top.addWidget(self.sub_title_edit)
-        sub_top.addWidget(self.sub_url_edit, 1)
-        sub_top.addWidget(btn_add_sub)
-        sub_top.addWidget(btn_refresh_subs)
-        subs_vbox.addLayout(sub_top)
-
-        self.subs_list_container = QWidget()
-        self.subs_list_layout = QVBoxLayout(self.subs_list_container)
-        self.subs_list_layout.setContentsMargins(0, 0, 0, 0)
-        self.subs_list_layout.setSpacing(6)
-        subs_vbox.addWidget(self.subs_list_container)
-        self.subs_drawer.hide()
-        root.addWidget(self.subs_drawer)
-
-        row2 = QFrame()
-        row2.setObjectName("PillBar")
-        r2 = QHBoxLayout(row2)
-        r2.setContentsMargins(12, 7, 12, 7)
-        r2.setSpacing(8)
-
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("جستجوی نام، کشور، پروتکل یا آدرس...")
-        self.search_edit.textChanged.connect(self._on_search_changed)
-
-        btn_ping_all = QPushButton("پینگ سریع همه")
-        btn_ping_all.setObjectName("GhostPillBtn")
-        btn_ping_all.clicked.connect(self.quick_ping_requested.emit)
-
-        self.sort_combo = QComboBox()
-        self.sort_combo.addItem("مرتب‌سازی: پینگ", "ping")
-        self.sort_combo.addItem("مرتب‌سازی: نام", "name")
-        self.sort_combo.addItem("مرتب‌سازی: پروتکل", "protocol")
-        self.sort_combo.currentIndexChanged.connect(self._on_sort_selected)
-
-        btn_dedup = QPushButton("حذف تکراری‌ها")
-        btn_dedup.setObjectName("GhostPillBtn")
-        btn_dedup.clicked.connect(self.deduplicate_requested.emit)
-
-        btn_clean_dead = QPushButton("پاکسازی خراب‌ها")
-        btn_clean_dead.setObjectName("DangerPillBtn")
-        btn_clean_dead.clicked.connect(self.remove_dead_requested.emit)
-
-        r2.addWidget(self.search_edit, 1)
-        r2.addWidget(btn_ping_all)
-        r2.addWidget(self.sort_combo)
-        r2.addWidget(btn_dedup)
-        r2.addWidget(btn_clean_dead)
-        root.addWidget(row2)
-
-        self.cards_container = QWidget()
-        self.cards_layout = QVBoxLayout(self.cards_container)
-        self.cards_layout.setContentsMargins(0, 4, 4, 6)
-        self.cards_layout.setSpacing(8)
-        self.cards_layout.addStretch()
-
-        self.scroll = make_transparent_scroll_area(self.cards_container)
-        root.addWidget(self.scroll, 1)
-
-    def show_feedback(self, message: str):
-        self.feedback_lbl.setText(sanitize_ui_text(message))
-
-    def _confirm_clear_all(self):
-        if not self._items:
-            self.show_feedback("مخزن در حال حاضر خالی است.")
-            return
-        dlg = ConfirmClearAllDialog(len(self._items), self._palette, self.window())
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.clear_all_requested.emit()
-
-    def _toggle_subs_drawer(self):
-        self.subs_drawer.setVisible(not self.subs_drawer.isVisible())
-
-    def _submit_subscription(self):
-        url = self.sub_url_edit.text().strip()
-        title = self.sub_title_edit.text().strip()
-        if not title:
-            title = "Subscription"
+        self.refresh_btn = ActionPillButton("refresh", I18N.t("subs_refresh_btn"), variant="gold")
+        self.refresh_btn.set_palette_theme(palette)
+        self.refresh_btn.clicked.connect(self.refresh_requested.emit)
+        hdr_row.addWidget(hdr_lbl)
+        hdr_row.addStretch()
+        hdr_row.addWidget(self.refresh_btn)
+        root.addLayout(hdr_row)
+
+        self.add_card = NeuCard(mode="raised", radius=16.0, depth=4.5, pad=5.5)
+        self.add_card.set_palette_theme(palette)
+        add_row = QHBoxLayout(self.add_card)
+        add_row.setContentsMargins(16, 13, 16, 13)
+        add_row.setSpacing(8)
+
+        self.title_edit = QLineEdit()
+        self.title_edit.setPlaceholderText(I18N.t("subs_title_ph"))
+        self.title_edit.setMaximumWidth(190)
+
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText(I18N.t("subs_url_ph"))
+        enforce_english_ltr(self.url_edit, mono_size=10)
+
+        self.add_btn = QPushButton(I18N.t("subs_add_btn"))
+        self.add_btn.setObjectName("AccentBtn")
+        self.add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_btn.clicked.connect(self._on_add)
+
+        add_row.addWidget(self.title_edit)
+        add_row.addWidget(self.url_edit, 1)
+        add_row.addWidget(self.add_btn)
+        root.addWidget(self.add_card)
+
+        sched_row = QHBoxLayout()
+        sched_lbl = QLabel(I18N.t("sub_autoupdate_lbl"))
+        sched_lbl.setObjectName("SecondaryLabel")
+        self.sched_combo = QComboBox()
+        for hrs in SUB_UPDATE_INTERVAL_HOURS:
+            lbl = I18N.t("sub_off") if hrs == 0 else I18N.t("sub_every_h", h=hrs)
+            self.sched_combo.addItem(lbl, hrs)
+        idx_h = self.sched_combo.findData(int(auto_update_hours or 0))
+        if idx_h >= 0:
+            self.sched_combo.setCurrentIndex(idx_h)
+        self.sched_combo.currentIndexChanged.connect(self._on_sched_changed)
+        sched_row.addWidget(sched_lbl)
+        sched_row.addWidget(self.sched_combo)
+        sched_row.addStretch()
+        root.addLayout(sched_row)
+
+        self.list_host = QWidget()
+        self.list_layout = QVBoxLayout(self.list_host)
+        self.list_layout.setContentsMargins(0, 2, 4, 2)
+        self.list_layout.setSpacing(8)
+        root.addWidget(make_transparent_scroll_area(self.list_host), 1)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        close_btn = QPushButton(I18N.t("close"))
+        close_btn.setObjectName("GhostBtn")
+        close_btn.clicked.connect(self.accept)
+        close_row.addWidget(close_btn)
+        root.addLayout(close_row)
+
+        self.populate_subscriptions(subscriptions)
+
+    def _on_add(self) -> None:
+        url = self.url_edit.text().strip()
+        title = self.title_edit.text().strip() or "Subscription"
         if url:
-            self.add_sub_requested.emit(url, title)
-            self.sub_url_edit.clear()
-            self.sub_title_edit.clear()
+            self.add_requested.emit(url, title)
+            self.url_edit.clear()
+            self.title_edit.clear()
 
-    def _on_paste_clicked(self):
-        clip = QGuiApplication.clipboard().text().strip()
-        if clip:
-            self.import_clipboard_requested.emit(clip)
-        else:
-            self.show_feedback("کلیپ‌بورد خالی است؛ ابتدا لینک کانفیگ را کپی کنید.")
+    def _on_sched_changed(self, idx: int) -> None:
+        hrs = self.sched_combo.itemData(idx)
+        if hrs is not None:
+            self.auto_update_hours_changed.emit(int(hrs))
 
-    def _on_import_file_clicked(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "انتخاب فایل کانفیگ",
-            "",
-            "Config Files (*.txt *.json *.conf *.sub);;All Files (*.*)",
-        )
-        if path:
-            self.import_file_requested.emit(path)
-
-    def _on_sort_selected(self, idx: int):
-        key = self.sort_combo.itemData(idx)
-        if key:
-            self.sort_requested.emit(str(key))
-
-    def _on_search_changed(self, text: str):
-        self._filter_query = text.strip().lower()
-        self.refresh_cards(self._items, self._active_idx, self._active_uid)
-
-    def _open_rename_dialog(self, index: int, old_name: str):
-        dlg = RenameProfileDialog(old_name, self._palette, self.window())
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            new_title = dlg.new_name()
-            if new_title:
-                self.rename_requested.emit(index, new_title)
-
-    def refresh_subscriptions(self, subs: list):
-        self.subs_list_container.setUpdatesEnabled(False)
+    def populate_subscriptions(self, subs: list) -> None:
+        self.list_host.setUpdatesEnabled(False)
         try:
-            self._subs = list(subs) if isinstance(subs, list) else []
-            while self.subs_list_layout.count():
-                child = self.subs_list_layout.takeAt(0)
-                if child.widget():
-                    child.widget().deleteLater()
+            self._item_cards.clear()
+            while self.list_layout.count():
+                item = self.list_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
 
-            if not self._subs:
-                empty = QLabel("هنوز لینک سابسکریپشنی ثبت نشده است.")
-                empty.setObjectName("MutedLabel")
-                self.subs_list_layout.addWidget(empty)
-                return
-
-            for idx, sub in enumerate(self._subs):
-                item_frame = QFrame()
-                item_frame.setObjectName("SubtleCard")
-                row = QHBoxLayout(item_frame)
-                row.setContentsMargins(12, 6, 12, 6)
+            for idx, sub in enumerate(subs or []):
+                card = NeuCard(mode="raised", radius=14.0, depth=3.8, pad=4.5)
+                card.set_palette_theme(self._palette)
+                self._item_cards.append(card)
+                row = QHBoxLayout(card)
+                row.setContentsMargins(16, 11, 16, 11)
                 row.setSpacing(10)
 
                 if isinstance(sub, dict):
-                    title = pick_first_text(sub, ("title", "name"), f"Sub #{idx + 1}")
-                    url = pick_first_text(sub, ("url",), "")
+                    title = strip_emojis(str(sub.get("title") or sub.get("name") or f"Sub #{idx + 1}"))
+                    url = str(sub.get("url") or "")
                 else:
                     title = f"Sub #{idx + 1}"
                     url = str(sub)
@@ -2342,558 +431,2573 @@ class ProfilesPage(QWidget):
                 u_lbl.setObjectName("MutedLabel")
                 enforce_english_ltr(u_lbl, mono_size=9)
 
-                del_btn = VectorIconButton("trash", size=26, danger_hover=True)
+                del_btn = VectorIconButton("trash", size=30, danger_hover=True)
                 del_btn.set_palette_theme(self._palette)
-                del_btn.clicked.connect(lambda _c=False, i=idx: self.delete_sub_requested.emit(i))
+                del_btn.clicked.connect(lambda _c=False, i=idx: self.delete_requested.emit(i))
 
                 row.addWidget(t_lbl)
                 row.addWidget(u_lbl, 1)
                 row.addWidget(del_btn)
-                self.subs_list_layout.addWidget(item_frame)
+                self.list_layout.addWidget(card)
+
+            self.list_layout.addStretch()
         finally:
-            self.subs_list_container.setUpdatesEnabled(True)
+            self.list_host.setUpdatesEnabled(True)
 
-    def refresh_cards(self, items: list[dict], active_index: int = -1, active_uid: str = ""):
-        self.cards_container.setUpdatesEnabled(False)
-        try:
-            self._items = list(items) if isinstance(items, list) else []
-            if active_uid:
-                self._active_uid = active_uid
 
-            resolved_idx = resolve_active_profile_index(
-                self._items,
-                fallback_index=active_index,
-                active_uid=self._active_uid,
+class ConfigEditorDialog(BaseThemedDialog):
+    def __init__(
+        self,
+        is_new: bool,
+        initial_data: dict | None,
+        vectors: list | None,
+        groups: list[str] | None,
+        palette: ThemePalette,
+        parent=None,
+        fingerprints: list | None = None,
+    ):
+        title = I18N.t("editor_new_title") if is_new else I18N.t("editor_edit_title")
+        super().__init__(title, palette, parent)
+        self._initial = dict(initial_data) if isinstance(initial_data, dict) else {}
+        self.setMinimumSize(700, 560)
+        self.resize(780, 650)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 16, 20, 16)
+        root.setSpacing(12)
+
+        top_row = QHBoxLayout()
+        hdr_lbl = QLabel(title)
+        hdr_lbl.setFont(make_ui_font(13, QFont.Weight.ExtraBold))
+        self.flag_preview = FlagBadgeWidget(GeoFlagResolver.resolve_code(self._initial), 32, 21)
+        self.flag_preview.set_palette_theme(palette)
+        top_row.addWidget(hdr_lbl)
+        top_row.addStretch()
+        top_row.addWidget(self.flag_preview)
+        root.addLayout(top_row)
+
+        host_w = QWidget()
+        form_vbox = QVBoxLayout(host_w)
+        form_vbox.setContentsMargins(0, 2, 6, 4)
+        form_vbox.setSpacing(12)
+
+        self.fields_card = NeuCard(mode="raised", radius=18.0, depth=5.0, pad=6.0)
+        self.fields_card.set_palette_theme(palette)
+        grid = QGridLayout(self.fields_card)
+        grid.setContentsMargins(20, 18, 20, 20)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(8)
+
+        self.name_edit = QLineEdit(strip_emojis(str(self._initial.get("name") or "")))
+        self.name_edit.textChanged.connect(self._refresh_flag)
+
+        self.group_combo = QComboBox()
+        self.group_combo.setEditable(True)
+        group_opts = ["Manual"] + [g for g in (groups or []) if g and g != "Manual"]
+        for g in dict.fromkeys(group_opts):
+            self.group_combo.addItem(g)
+        self.group_combo.setCurrentText(extract_profile_group(self._initial))
+
+        self.proto_combo = QComboBox()
+        for p_key, p_lbl in (
+            ("vless", "VLESS"),
+            ("vmess", "VMess"),
+            ("trojan", "Trojan"),
+            ("ss", "Shadowsocks"),
+            ("tuic", "TUIC"),
+            ("hysteria2", "Hysteria2"),
+        ):
+            self.proto_combo.addItem(p_lbl, p_key)
+        enforce_english_ltr(self.proto_combo, mono_size=10, bold=True)
+
+        addr_init = str(self._initial.get("host") or self._initial.get("original_host") or self._initial.get("address") or "")
+        self.addr_edit = QLineEdit(addr_init)
+        enforce_english_ltr(self.addr_edit, mono_size=10)
+        self.addr_edit.textChanged.connect(self._refresh_flag)
+
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1, 65535)
+        port_init = get_int(self._initial, "port", 443)
+        self.port_spin.setValue(port_init if 1 <= port_init <= 65535 else 443)
+        enforce_english_ltr(self.port_spin, mono_size=10)
+
+        cred_init = str(self._initial.get("uuid_or_password") or self._initial.get("uuid") or self._initial.get("password") or "")
+        self.cred_edit = QLineEdit(cred_init)
+        enforce_english_ltr(self.cred_edit, mono_size=10)
+
+        self.vec_combo = QComboBox()
+        enforce_english_ltr(self.vec_combo, mono_size=10, bold=True)
+        self.vec_combo.addItem("AUTO", "AUTO")
+        for vid, vlabel in normalize_vector_entries(vectors):
+            self.vec_combo.addItem(vlabel, vid)
+
+        self.net_combo = QComboBox()
+        for n_opt in ("ws", "tcp", "grpc", "httpupgrade", "xhttp", "quic"):
+            self.net_combo.addItem(n_opt, n_opt)
+        enforce_english_ltr(self.net_combo, mono_size=10)
+
+        self.sec_combo = QComboBox()
+        for s_opt in ("tls", "reality", "none"):
+            self.sec_combo.addItem(s_opt, s_opt)
+        enforce_english_ltr(self.sec_combo, mono_size=10)
+
+        self.sni_edit = QLineEdit(str(self._initial.get("sni") or self._initial.get("server_name") or ""))
+        enforce_english_ltr(self.sni_edit, mono_size=10)
+        self.sni_edit.textChanged.connect(self._refresh_flag)
+
+        self.host_hdr_edit = QLineEdit(str(self._initial.get("host_header") or ""))
+        enforce_english_ltr(self.host_hdr_edit, mono_size=10)
+
+        self.path_edit = QLineEdit(str(self._initial.get("path") or self._initial.get("service_name") or "/"))
+        enforce_english_ltr(self.path_edit, mono_size=10)
+
+        self.alpn_combo = QComboBox()
+        self.alpn_combo.setEditable(True)
+        for a_opt in ("", "h2,http/1.1", "http/1.1", "h2", "h3"):
+            self.alpn_combo.addItem(a_opt)
+        enforce_english_ltr(self.alpn_combo, mono_size=10)
+
+        self.fp_combo = QComboBox()
+        enforce_english_ltr(self.fp_combo, mono_size=10)
+        for fp_val, fp_lbl in normalize_fingerprint_entries(fingerprints):
+            self.fp_combo.addItem(fp_lbl, fp_val)
+
+        self.pbk_edit = QLineEdit(str(self._initial.get("public_key") or self._initial.get("pbk") or ""))
+        enforce_english_ltr(self.pbk_edit, mono_size=10)
+
+        self.sid_edit = QLineEdit(str(self._initial.get("short_id") or self._initial.get("sid") or ""))
+        enforce_english_ltr(self.sid_edit, mono_size=10)
+
+        spec = [
+            ("Profile Name:", self.name_edit, 0, 0),
+            ("Subscription / Group:", self.group_combo, 0, 1),
+            ("Protocol:", self.proto_combo, 1, 0),
+            ("Bound Method:", self.vec_combo, 1, 1),
+            ("Server Host / IP:", self.addr_edit, 2, 0),
+            ("Port:", self.port_spin, 2, 1),
+            ("UUID / Password:", self.cred_edit, 3, 0),
+            ("Transport Network:", self.net_combo, 3, 1),
+            ("Security Layer:", self.sec_combo, 4, 0),
+            ("TLS SNI:", self.sni_edit, 4, 1),
+            ("Host Header:", self.host_hdr_edit, 5, 0),
+            ("Path / ServiceName:", self.path_edit, 5, 1),
+            ("ALPN:", self.alpn_combo, 6, 0),
+            ("uTLS Fingerprint:", self.fp_combo, 6, 1),
+            ("Reality PublicKey (pbk):", self.pbk_edit, 7, 0),
+            ("Reality ShortId (sid):", self.sid_edit, 7, 1),
+        ]
+        for lbl_txt, widget, r, c in spec:
+            lbl = QLabel(lbl_txt)
+            lbl.setObjectName("SecondaryLabel")
+            grid.addWidget(lbl, r * 2, c)
+            grid.addWidget(widget, r * 2 + 1, c)
+
+        form_vbox.addWidget(self.fields_card)
+
+        self.raw_card = NeuCard(mode="raised", radius=16.0, depth=4.5, pad=5.5)
+        self.raw_card.set_palette_theme(palette)
+        raw_vbox = QVBoxLayout(self.raw_card)
+        raw_vbox.setContentsMargins(18, 14, 18, 16)
+        raw_vbox.setSpacing(8)
+
+        raw_hdr = QHBoxLayout()
+        raw_lbl = QLabel(I18N.t("editor_use_raw"))
+        raw_lbl.setObjectName("SecondaryLabel")
+        self.sw_raw = AnimatedToggleSwitch(checked=get_bool(self._initial, "use_raw_uri", False))
+        self.sw_raw.set_palette_theme(palette)
+        self.sw_raw.toggled.connect(self._sync_raw_mode)
+        raw_hdr.addWidget(raw_lbl)
+        raw_hdr.addStretch()
+        raw_hdr.addWidget(self.sw_raw)
+        raw_vbox.addLayout(raw_hdr)
+
+        self.raw_edit = QPlainTextEdit(str(self._initial.get("raw_uri") or self._initial.get("uri") or ""))
+        self.raw_edit.setObjectName("CodeEditor")
+        self.raw_edit.setMaximumHeight(92)
+        enforce_english_ltr(self.raw_edit, mono_size=10)
+        raw_vbox.addWidget(self.raw_edit)
+
+        form_vbox.addWidget(self.raw_card)
+        form_vbox.addStretch()
+        root.addWidget(make_transparent_scroll_area(host_w), 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton(I18N.t("cancel"))
+        cancel_btn.setObjectName("GhostBtn")
+        cancel_btn.clicked.connect(self.reject)
+        save_btn = QPushButton(I18N.t("save"))
+        save_btn.setObjectName("AccentBtn")
+        save_btn.clicked.connect(self.accept)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        root.addLayout(btn_row)
+
+        self._apply_initial_combos()
+        self._sync_raw_mode(self.sw_raw.isChecked())
+
+    def _apply_initial_combos(self) -> None:
+        proto = str(self._initial.get("protocol") or "vless").lower()
+        if proto == "shadowsocks":
+            proto = "ss"
+        idx = self.proto_combo.findData(proto)
+        if idx >= 0:
+            self.proto_combo.setCurrentIndex(idx)
+
+        for combo, key, default in (
+            (self.net_combo, "network", "ws"),
+            (self.sec_combo, "security", "tls"),
+        ):
+            val = str(self._initial.get(key) or default).lower()
+            i = combo.findData(val)
+            if i >= 0:
+                combo.setCurrentIndex(i)
+
+        pref_v = str(self._initial.get("preferred_vector_id") or self._initial.get("cached_vector_id") or "AUTO").strip()
+        if pref_v and self.vec_combo.findData(pref_v) < 0:
+            self.vec_combo.addItem(pref_v, pref_v)
+        iv = self.vec_combo.findData(pref_v)
+        if iv >= 0:
+            self.vec_combo.setCurrentIndex(iv)
+
+        self.alpn_combo.setCurrentText(str(self._initial.get("alpn") or ""))
+
+        init_fp = str(self._initial.get("fingerprint") or "custom_poly").strip()
+        if init_fp and self.fp_combo.findData(init_fp) < 0:
+            self.fp_combo.addItem(init_fp, init_fp)
+        ifp = self.fp_combo.findData(init_fp)
+        if ifp >= 0:
+            self.fp_combo.setCurrentIndex(ifp)
+
+    def _refresh_flag(self) -> None:
+        code = GeoFlagResolver.resolve_code(self.name_edit.text(), self.sni_edit.text(), self.addr_edit.text())
+        self.flag_preview.set_country_code(code)
+
+    def _sync_raw_mode(self, use_raw: bool) -> None:
+        self.fields_card.setEnabled(not use_raw)
+        self.raw_edit.setReadOnly(not use_raw)
+
+    def collect_data(self) -> dict:
+        out = dict(self._initial)
+        host_txt = self.addr_edit.text().strip()
+        raw_txt = self.raw_edit.toPlainText().strip()
+        pref_v = str(self.vec_combo.currentData() or "AUTO")
+        fp_val = str(self.fp_combo.currentData() or "custom_poly")
+        out.update(
+            {
+                "name": self.name_edit.text().strip() or "Alan Node",
+                "group": self.group_combo.currentText().strip() or "Manual",
+                "protocol": str(self.proto_combo.currentData() or "vless"),
+                "host": host_txt,
+                "address": host_txt,
+                "port": int(self.port_spin.value()),
+                "uuid_or_password": self.cred_edit.text().strip(),
+                "network": str(self.net_combo.currentData() or "ws"),
+                "security": str(self.sec_combo.currentData() or "tls"),
+                "sni": self.sni_edit.text().strip(),
+                "host_header": self.host_hdr_edit.text().strip(),
+                "path": self.path_edit.text().strip(),
+                "alpn": self.alpn_combo.currentText().strip(),
+                "fingerprint": fp_val,
+                "public_key": self.pbk_edit.text().strip(),
+                "pbk": self.pbk_edit.text().strip(),
+                "short_id": self.sid_edit.text().strip(),
+                "sid": self.sid_edit.text().strip(),
+                "preferred_vector_id": pref_v,
+                "raw_uri": raw_txt,
+                "uri": raw_txt,
+                "use_raw_uri": bool(self.sw_raw.isChecked()),
+            }
+        )
+        return out
+
+
+class CompactTelemetryCard(NeuCard):
+    def __init__(
+        self,
+        i18n_key: str,
+        icon_name: str,
+        line_hex: str,
+        with_sparkline: bool = True,
+        stepped: bool = False,
+        with_flag: bool = False,
+        parent=None,
+    ):
+        super().__init__(mode="raised", radius=18.0, depth=5.0, pad=6.0, parent=parent)
+        self.setMinimumHeight(118)
+        self._i18n_key = i18n_key
+        self._line_hex = line_hex
+
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(16, 13, 16, 13)
+        vbox.setSpacing(5)
+
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        self.glyph = VectorGlyph(icon_name, size=26, custom_hex=line_hex)
+        self.title_lbl = QLabel(I18N.t(i18n_key))
+        self.title_lbl.setObjectName("MutedLabel")
+        self.title_lbl.setFont(make_ui_font(9, QFont.Weight.Bold))
+        top.addWidget(self.glyph)
+        top.addWidget(self.title_lbl)
+        top.addStretch()
+
+        self.flag_badge: FlagBadgeWidget | None = None
+        if with_flag:
+            self.flag_badge = FlagBadgeWidget("", 28, 19)
+            top.addWidget(self.flag_badge)
+
+        self.value_lbl = QLabel("---")
+        enforce_english_ltr(self.value_lbl, mono_size=13, bold=True)
+
+        vbox.addLayout(top)
+        vbox.addWidget(self.value_lbl)
+
+        self.sparkline: LiveSparklineWidget | None = None
+        self.sub_lbl: QLabel | None = None
+        if with_sparkline:
+            self.sparkline = LiveSparklineWidget(stepped=stepped)
+            vbox.addWidget(self.sparkline)
+        else:
+            self.sub_lbl = QLabel("---")
+            self.sub_lbl.setObjectName("SecondaryLabel")
+            vbox.addStretch()
+            vbox.addWidget(self.sub_lbl)
+
+    def retranslate_ui(self) -> None:
+        self.title_lbl.setText(I18N.t(self._i18n_key))
+        self.title_lbl.setFont(make_ui_font(9, QFont.Weight.Bold))
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
+        super().set_palette_theme(palette)
+        self.glyph.set_palette_theme(palette, self._line_hex)
+        if self.flag_badge is not None:
+            self.flag_badge.set_palette_theme(palette)
+        if self.sparkline is not None:
+            self.sparkline.set_palette_theme(palette, self._line_hex)
+
+
+class HomePage(QWidget):
+    connect_triggered = Signal(str)
+    disconnect_triggered = Signal()
+    output_selection_changed = Signal(str)
+    ping_verified_requested = Signal()
+    clear_verified_requested = Signal()
+    system_proxy_toggled = Signal(bool)
+    tun_mode_toggled = Signal(bool)
+    autopilot_toggled = Signal(bool)
+
+    SMART_AUTO_KEY = "__SMART_AUTO__"
+    SMART_POOL_KEY = SMART_AUTO_KEY
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._palette: ThemePalette = DARK_PALETTE
+        self._ui_phase = "IDLE"
+        self._is_connected = False
+        self._is_connecting = False
+        self._autopilot_enabled = True
+        self._selected_profile_uid = ""
+        self._verified_outputs: list[dict] = []
+        self._vault_profiles: list[dict] = []
+        self._last_snap: dict = {}
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 10, 18, 12)
+        root.setSpacing(10)
+
+        self.hero_card = QFrame()
+        self.hero_card.setObjectName("HeroCard")
+        self.hero_card.setStyleSheet("QFrame#HeroCard { background: transparent; border: none; }")
+        hero_vbox = QVBoxLayout(self.hero_card)
+        hero_vbox.setContentsMargins(30, 22, 30, 20)
+        hero_vbox.setSpacing(14)
+
+        center_row = QHBoxLayout()
+        center_row.setSpacing(26)
+
+        self.radar_core = AnimatedRadarCore()
+        self.radar_core.clicked.connect(self._on_main_button_clicked)
+
+        info_col = QVBoxLayout()
+        info_col.setSpacing(10)
+        info_col.addStretch()
+
+        title_line = QHBoxLayout()
+        title_line.setSpacing(10)
+        self.headline_lbl = QLabel(I18N.t("status_idle"))
+        self.headline_lbl.setFont(make_ui_font(21, QFont.Weight.ExtraBold))
+
+        self.gemini_pill = QLabel(I18N.t("gemini_ready"))
+        self.gemini_pill.setObjectName("EmeraldPill")
+        self.gemini_pill.hide()
+
+        self.vec_pill = QLabel("AUTO")
+        self.vec_pill.setObjectName("BadgePill")
+        enforce_english_ltr(self.vec_pill, mono_size=10, bold=True)
+
+        title_line.addWidget(self.headline_lbl)
+        title_line.addWidget(self.vec_pill)
+        title_line.addWidget(self.gemini_pill)
+        title_line.addStretch()
+
+        self.detail_lbl = QLabel(I18N.t("sub_idle"))
+        self.detail_lbl.setObjectName("SecondaryLabel")
+        self.detail_lbl.setWordWrap(True)
+
+        ctrl_line = QHBoxLayout()
+        ctrl_line.setSpacing(14)
+        self.connect_btn = KineticConnectButton()
+        self.connect_btn.clicked.connect(self._on_main_button_clicked)
+        self.chronometer = SpoilerChronometer()
+        ctrl_line.addWidget(self.connect_btn)
+        ctrl_line.addWidget(self.chronometer)
+        ctrl_line.addStretch()
+
+        info_col.addLayout(title_line)
+        info_col.addWidget(self.detail_lbl)
+        info_col.addSpacing(2)
+        info_col.addLayout(ctrl_line)
+        info_col.addStretch()
+
+        center_row.addWidget(self.radar_core, 0, Qt.AlignmentFlag.AlignVCenter)
+        center_row.addLayout(info_col, 1)
+
+        self.route_strip = RouteTopologyStrip()
+
+        hero_vbox.addLayout(center_row, 1)
+        hero_vbox.addWidget(self.route_strip)
+        root.addWidget(self.hero_card, 1)
+
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(10)
+        self.ip_card = CompactTelemetryCard("card_egress_ip", "globe", "#FFD000", with_sparkline=False, with_flag=True)
+        self.ping_card = CompactTelemetryCard("card_real_ping", "wave", "#10B981", with_sparkline=True, stepped=True)
+        self.dl_card = CompactTelemetryCard("card_dl_speed", "download", "#FFD000", with_sparkline=True)
+        self.ul_card = CompactTelemetryCard("card_ul_speed", "upload", "#38BDF8", with_sparkline=True)
+        self.ip_card.value_lbl.setText("---")
+        self.ping_card.value_lbl.setText("---")
+        self.dl_card.value_lbl.setText("0 B/s")
+        self.ul_card.value_lbl.setText("0 B/s")
+
+        for c in (self.ip_card, self.ping_card, self.dl_card, self.ul_card):
+            cards_row.addWidget(c, 1)
+        root.addLayout(cards_row)
+
+        self.dock_card = NeuCard(mode="dock", radius=18.0, depth=5.2, pad=6.0)
+        dock_vbox = QVBoxLayout(self.dock_card)
+        dock_vbox.setContentsMargins(20, 13, 20, 13)
+        dock_vbox.setSpacing(9)
+
+        out_row = QHBoxLayout()
+        out_row.setSpacing(10)
+        self.out_lbl = QLabel(I18N.t("output_selector_lbl"))
+        self.out_lbl.setObjectName("SecondaryLabel")
+
+        self.output_combo = QComboBox()
+        self.output_combo.setIconSize(QSize(24, 16))
+        self.output_combo.currentIndexChanged.connect(self._on_output_combo_changed)
+
+        self.ping_out_btn = ActionPillButton("bolt", I18N.t("ping_outputs_btn"), variant="ghost")
+        self.ping_out_btn.clicked.connect(self.ping_verified_requested.emit)
+
+        self.clear_out_btn = VectorIconButton("trash", size=34, danger_hover=True)
+        self.clear_out_btn.setToolTip(I18N.t("clear_outputs_tip"))
+        self.clear_out_btn.clicked.connect(self.clear_verified_requested.emit)
+
+        out_row.addWidget(self.out_lbl)
+        out_row.addWidget(self.output_combo, 1)
+        out_row.addWidget(self.ping_out_btn)
+        out_row.addWidget(self.clear_out_btn)
+
+        sw_row = QHBoxLayout()
+        sw_row.setSpacing(12)
+
+        self.sw_sys_proxy = AnimatedToggleSwitch(checked=True)
+        self.sw_sys_proxy.toggled.connect(self.system_proxy_toggled.emit)
+        self.lbl_sys_proxy = QLabel(I18N.t("sw_sys_proxy"))
+        self.lbl_sys_proxy.setObjectName("SecondaryLabel")
+
+        self.sw_tun = AnimatedToggleSwitch(checked=False)
+        self.sw_tun.toggled.connect(self.tun_mode_toggled.emit)
+        self.lbl_tun = QLabel(I18N.t("sw_tun_mode"))
+        self.lbl_tun.setObjectName("SecondaryLabel")
+        self.tun_pill = QLabel("OFF")
+        self.tun_pill.setObjectName("MutedPill")
+        enforce_english_ltr(self.tun_pill, mono_size=9, bold=True)
+
+        self.sw_autopilot = AnimatedToggleSwitch(checked=True)
+        self.sw_autopilot.toggled.connect(self._on_autopilot_user_toggled)
+        self.lbl_autopilot = QLabel(I18N.t("sw_autopilot"))
+        self.lbl_autopilot.setObjectName("SecondaryLabel")
+
+        sw_row.addWidget(self.sw_sys_proxy)
+        sw_row.addWidget(self.lbl_sys_proxy)
+        sw_row.addSpacing(12)
+        sw_row.addWidget(self.sw_tun)
+        sw_row.addWidget(self.lbl_tun)
+        sw_row.addWidget(self.tun_pill)
+        sw_row.addSpacing(12)
+        sw_row.addWidget(self.sw_autopilot)
+        sw_row.addWidget(self.lbl_autopilot)
+        sw_row.addStretch()
+
+        dock_vbox.addLayout(out_row)
+        dock_vbox.addLayout(sw_row)
+        root.addWidget(self.dock_card)
+
+        self._rebuild_output_combo()
+        self._refresh_visual_route()
+
+    def selected_output_key(self) -> str:
+        data = self.output_combo.currentData()
+        return str(data) if data is not None else self.SMART_AUTO_KEY
+
+    def _on_main_button_clicked(self) -> None:
+        if self._is_connecting or self._is_connected:
+            self.disconnect_triggered.emit()
+        else:
+            self.connect_triggered.emit(self.selected_output_key())
+
+    def _on_autopilot_user_toggled(self, checked: bool) -> None:
+        self._autopilot_enabled = bool(checked)
+        if self._autopilot_enabled:
+            with QSignalBlocker(self.output_combo):
+                self.output_combo.setCurrentIndex(0)
+            self.autopilot_toggled.emit(True)
+        else:
+            self.autopilot_toggled.emit(False)
+            target_idx = -1
+            if self._selected_profile_uid:
+                target_idx = self.output_combo.findData(self._selected_profile_uid)
+            if target_idx < 1 and self.output_combo.count() > 1:
+                target_idx = 1
+            if target_idx >= 1:
+                with QSignalBlocker(self.output_combo):
+                    self.output_combo.setCurrentIndex(target_idx)
+                chosen_uid = str(self.output_combo.itemData(target_idx) or "")
+                if chosen_uid:
+                    self._selected_profile_uid = chosen_uid
+                    self.output_selection_changed.emit(chosen_uid)
+        self._refresh_visual_route()
+
+    def _on_output_combo_changed(self, idx: int) -> None:
+        if idx < 0:
+            return
+        key = self.selected_output_key()
+        if key in (self.SMART_AUTO_KEY, "__smart_pool__"):
+            self._autopilot_enabled = True
+            set_switch_blocked(self.sw_autopilot, True)
+            with QSignalBlocker(self.output_combo):
+                self.output_combo.setCurrentIndex(0)
+            self.autopilot_toggled.emit(True)
+        else:
+            self._autopilot_enabled = False
+            self._selected_profile_uid = key
+            set_switch_blocked(self.sw_autopilot, False)
+            self.autopilot_toggled.emit(False)
+            self.output_selection_changed.emit(key)
+        self._refresh_visual_route()
+
+    def set_vault_profiles_context(self, profiles: list[dict], selected_index: int = -1) -> None:
+        self._vault_profiles = list(profiles or [])
+        if 0 <= selected_index < len(self._vault_profiles):
+            self._selected_profile_uid = extract_profile_uid(self._vault_profiles[selected_index], selected_index)
+        else:
+            for i, p in enumerate(self._vault_profiles):
+                if get_bool(p, "is_selected", False):
+                    self._selected_profile_uid = extract_profile_uid(p, i)
+                    break
+        self._rebuild_output_combo()
+
+    def set_verified_outputs(self, outputs: list[dict], select_uid: str = "") -> None:
+        self._verified_outputs = list(outputs or [])
+        if select_uid:
+            self._selected_profile_uid = select_uid
+        self._rebuild_output_combo()
+        self._refresh_visual_route()
+
+    def _collect_selectable_configs(self) -> list[dict]:
+        combined: list[dict] = []
+        seen_uids: set[str] = set()
+
+        for idx, item in enumerate(self._verified_outputs):
+            uid = extract_profile_uid(item, idx)
+            if uid and uid not in seen_uids:
+                seen_uids.add(uid)
+                combined.append(item)
+
+        for idx, prof in enumerate(self._vault_profiles):
+            uid = extract_profile_uid(prof, idx)
+            st = str(prof.get("status") or "").upper()
+            is_sel = (uid == self._selected_profile_uid) or get_bool(prof, "is_selected", False)
+            if uid and (uid not in seen_uids) and (st == "VERIFIED" or is_sel):
+                seen_uids.add(uid)
+                combined.append(prof)
+
+        return combined
+
+    def _rebuild_output_combo(self) -> None:
+        candidates = self._collect_selectable_configs()
+        with QSignalBlocker(self.output_combo):
+            self.output_combo.clear()
+            self.output_combo.addItem(
+                make_vector_qicon("bolt", "#FFD000", 18),
+                I18N.t("smart_auto_pool"),
+                self.SMART_AUTO_KEY,
             )
-            if (resolved_idx < 0) and (self._active_idx >= 0) and (self._active_idx < len(self._items)):
-                resolved_idx = self._active_idx
 
-            self._active_idx = resolved_idx
-            self.count_badge.setText(f"{len(self._items)} ITEMS")
-
-            while self.cards_layout.count():
-                child = self.cards_layout.takeAt(0)
-                if child.widget():
-                    child.widget().deleteLater()
-
-            matched = 0
-            for idx, item in enumerate(self._items):
-                if self._filter_query:
-                    spec = GeoFlagResolver.get_spec(GeoFlagResolver.resolve_code(item))
-                    haystack = " ".join(
-                        [
-                            *(
-                                str(item.get(k, ""))
-                                for k in (
-                                    "name",
-                                    "title",
-                                    "protocol",
-                                    "host",
-                                    "original_host",
-                                    "address",
-                                    "endpoint",
-                                    "sni",
-                                )
-                            ),
-                            spec.fa_name,
-                            spec.en_name,
-                            spec.code,
-                        ]
-                    ).lower()
-                    if self._filter_query not in haystack:
-                        continue
-                matched += 1
-                is_card_active = get_bool_value(item, "is_selected", False)
-                if not is_card_active:
-                    is_card_active = (idx == resolved_idx)
-                card = ProfileCardWidget(idx, item, is_card_active, self._palette)
-                card.selected.connect(self.select_requested.emit)
-                card.deleted.connect(self.delete_requested.emit)
-                card.full_edit_requested.connect(self.open_config_editor_requested.emit)
-                card.rename_requested.connect(self._open_rename_dialog)
-                card.clone_clean_requested.connect(lambda i: self.clone_clean_requested.emit(i, 3))
-                card.send_to_scanner_requested.connect(self.send_to_scanner_requested.emit)
-                card.copied_uri.connect(self.show_feedback)
-                self.cards_layout.addWidget(card)
-
-            if matched == 0:
-                empty = QLabel(
-                    "هیچ کانفیگی در مخزن وجود ندارد. از «افزودن دستی کانفیگ جدید» یا «افزودن از کلیپ‌بورد» استفاده کنید."
+            matched_idx = -1
+            for idx, item in enumerate(candidates):
+                uid = extract_profile_uid(item, idx)
+                name = GeoFlagResolver.clean_display_name(
+                    str(item.get("name") or item.get("title") or f"Output #{idx + 1}")
                 )
-                empty.setObjectName("MutedLabel")
-                empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.cards_layout.addWidget(empty)
+                proto = str(item.get("protocol") or "VLESS").upper()
+                vec = str(item.get("vector_id") or item.get("cached_vector_id") or item.get("preferred_vector_id") or "AUTO")
+                ping = get_int(item, "ping_ms", 0)
+                ping_str = f"{ping}ms" if ping > 0 else "OK"
+                cc = GeoFlagResolver.resolve_code(item)
+                label = I18N.t("verified_item_fmt", name=name, proto=proto, vec=vec, ping=ping_str)
+                if is_gemini_verified(item):
+                    label = f"{label} [Gemini]"
+                self.output_combo.addItem(make_flag_qicon(cc, 24, 16), label, uid)
+                if uid == self._selected_profile_uid:
+                    matched_idx = idx + 1
 
-            self.cards_layout.addStretch()
-        finally:
-            self.cards_container.setUpdatesEnabled(True)
+            if self._autopilot_enabled:
+                self.output_combo.setCurrentIndex(0)
+            elif matched_idx >= 1:
+                self.output_combo.setCurrentIndex(matched_idx)
+            elif self.output_combo.count() > 1:
+                self.output_combo.setCurrentIndex(1)
+            else:
+                self.output_combo.setCurrentIndex(0)
 
-    def set_palette_theme(self, palette: ThemePalette):
+    def sync_autopilot_state(self, autopilot_enabled: bool, selected_uid: str = "") -> None:
+        self._autopilot_enabled = bool(autopilot_enabled)
+        if selected_uid:
+            self._selected_profile_uid = selected_uid
+        set_switch_blocked(self.sw_autopilot, self._autopilot_enabled)
+        self._rebuild_output_combo()
+
+    def sync_switches(self, settings: dict) -> None:
+        if "system_proxy" in settings:
+            set_switch_blocked(self.sw_sys_proxy, get_bool(settings, "system_proxy", True))
+
+        if ("autopilot_enabled" in settings) or ("autopilot" in settings):
+            ap_key = "autopilot_enabled" if ("autopilot_enabled" in settings) else "autopilot"
+            ap_on = get_bool(settings, ap_key, True)
+            sel_uid = str(settings.get("active_profile_uid") or self._selected_profile_uid)
+            self.sync_autopilot_state(ap_on, sel_uid)
+
+        if ("tun_enabled" in settings) or ("tun_badge" in settings):
+            tun_en = bool(settings.get("tun_enabled"))
+            tun_b = str(settings.get("tun_badge") or "")
+            self.apply_tun_status(tun_en, tun_en and self._is_connected, "", tun_b)
+
+    def apply_tun_status(
+        self,
+        enabled: bool,
+        active: bool = False,
+        detail: str = "",
+        tun_badge: str = "",
+    ) -> None:
+        tun_en = bool(enabled)
+        set_switch_blocked(self.sw_tun, tun_en)
+
+        badge_upper = str(tun_badge or "").strip().upper()
+        is_on = (badge_upper == "ON") or tun_en or bool(active)
+        self.tun_pill.setText("ON" if is_on else "OFF")
+        obj = "EmeraldPill" if is_on else "MutedPill"
+        if self.tun_pill.objectName() != obj:
+            self.tun_pill.setObjectName(obj)
+            self.tun_pill.style().unpolish(self.tun_pill)
+            self.tun_pill.style().polish(self.tun_pill)
+        if detail:
+            self.tun_pill.setToolTip(strip_emojis(detail))
+
+    def _resolve_current_output_dict(self) -> dict:
+        sel = self.selected_output_key()
+        if sel != self.SMART_AUTO_KEY:
+            for item in self._collect_selectable_configs():
+                if extract_profile_uid(item, -1) == sel:
+                    return item
+        if self._verified_outputs:
+            return self._verified_outputs[0]
+        if self._vault_profiles:
+            return self._vault_profiles[0]
+        return {}
+
+    def _set_gemini_pill_state(self, ready: bool, show_unverified: bool) -> None:
+        if ready:
+            self.gemini_pill.setText(I18N.t("gemini_ready"))
+            if self.gemini_pill.objectName() != "EmeraldPill":
+                self.gemini_pill.setObjectName("EmeraldPill")
+                self.gemini_pill.style().unpolish(self.gemini_pill)
+                self.gemini_pill.style().polish(self.gemini_pill)
+            self.gemini_pill.show()
+        elif show_unverified:
+            self.gemini_pill.setText(I18N.t("gemini_unverified"))
+            if self.gemini_pill.objectName() != "MutedPill":
+                self.gemini_pill.setObjectName("MutedPill")
+                self.gemini_pill.style().unpolish(self.gemini_pill)
+                self.gemini_pill.style().polish(self.gemini_pill)
+            self.gemini_pill.show()
+        else:
+            self.gemini_pill.hide()
+
+    def _refresh_visual_route(self) -> None:
+        snap = self._last_snap
+        ping = get_int(snap, "ping_ms", 0) if self._is_connected else 0
+
+        if self._is_connected:
+            eg_code = str(snap.get("egress_country_code") or "").strip().upper()
+            if eg_code == "UK":
+                eg_code = "GB"
+
+            raw_ip = str(snap.get("egress_ip") or "").strip()
+            disp_ip = raw_ip if (raw_ip and raw_ip not in ("—", "---")) else "---"
+
+            dest_label = strip_emojis(str(snap.get("destination_label") or "").strip())
+            if not dest_label or dest_label in ("—", "---"):
+                eg_name = strip_emojis(str(snap.get("egress_country") or "").strip())
+                if eg_name and eg_code:
+                    dest_label = f"{eg_name} ({eg_code})"
+                elif eg_name:
+                    dest_label = eg_name
+                elif eg_code:
+                    spec_c = GeoFlagResolver.get_spec(eg_code)
+                    dest_label = f"{spec_c.localized_name()} ({eg_code})"
+                else:
+                    dest_label = "---"
+
+            has_explicit_gem = "gemini_ready" in snap
+            gem_ok = get_bool(snap, "gemini_ready", False) if has_explicit_gem else is_gemini_verified(snap)
+        else:
+            eg_code = ""
+            disp_ip = "---"
+            dest_label = "---"
+            has_explicit_gem = False
+            gem_ok = False
+
+        self.radar_core.set_country_code(eg_code)
+        self.route_strip.set_route_state(
+            dest_code=eg_code,
+            ip_text=disp_ip,
+            ping_ms=ping,
+            phase=self._ui_phase,
+            gemini_ready=gem_ok,
+            dest_label=dest_label,
+        )
+        self._set_gemini_pill_state(
+            ready=gem_ok,
+            show_unverified=(self._is_connected and has_explicit_gem and not gem_ok),
+        )
+
+        self.ip_card.value_lbl.setText(disp_ip)
+        if self.ip_card.flag_badge is not None:
+            self.ip_card.flag_badge.set_country_code(eg_code)
+        if self.ip_card.sub_lbl is not None:
+            if self._is_connected and eg_code:
+                self.ip_card.sub_lbl.setText(dest_label)
+            else:
+                self.ip_card.sub_lbl.setText("---")
+
+    def apply_telemetry(self, snap: dict) -> None:
+        self._last_snap = dict(snap)
+        raw_phase = str(snap.get("ui_phase") or "").upper()
+        raw_state = str(snap.get("state") or "disconnected").lower()
+
+        def_conn = (raw_phase == "CONNECTING") or (raw_state in ("connecting", "probing", "scanning", "starting"))
+        def_ok = (raw_phase == "CONNECTED") or (raw_state in ("connected", "online", "active"))
+
+        self._is_connecting = get_bool(snap, "is_connecting", def_conn)
+        self._is_connected = get_bool(snap, "is_connected", def_ok)
+
+        if self._is_connecting:
+            self._ui_phase = "CONNECTING"
+        elif self._is_connected:
+            self._ui_phase = "CONNECTED"
+        elif raw_phase == "ERROR" or raw_state in ("error", "failed"):
+            self._ui_phase = "ERROR"
+        else:
+            self._ui_phase = "IDLE"
+
+        tun_en = bool(snap.get("tun_enabled"))
+        tun_b = str(snap.get("tun_badge") or "")
+        self.apply_tun_status(tun_en, tun_en and self._is_connected, "", tun_b)
+
+        snap_uid = str(snap.get("active_profile_uid") or "").strip()
+        if "autopilot_enabled" in snap:
+            self.sync_autopilot_state(bool(snap.get("autopilot_enabled")), snap_uid)
+        elif self._autopilot_enabled:
+            with QSignalBlocker(self.output_combo):
+                self.output_combo.setCurrentIndex(0)
+        elif snap_uid and snap_uid != self._selected_profile_uid:
+            self.sync_autopilot_state(False, snap_uid)
+
+        self.radar_core.set_ui_phase(self._ui_phase)
+        self.connect_btn.set_phase_and_label(self._ui_phase, str(snap.get("button_text") or ""))
+        self.chronometer.set_uptime_state(str(snap.get("uptime_label") or "00:00:00"), self._is_connected)
+
+        default_head = (
+            I18N.t("status_connecting")
+            if self._is_connecting
+            else (I18N.t("status_connected") if self._is_connected else I18N.t("status_idle"))
+        )
+        raw_head = strip_emojis(str(snap.get("status_headline") or ""))
+        self.headline_lbl.setText(raw_head if (raw_head and I18N.lang == "fa") else default_head)
+
+        raw_det = strip_emojis(str(snap.get("status_detail") or ""))
+        self.detail_lbl.setText(raw_det if raw_det else I18N.t("sub_idle"))
+
+        vec_id = strip_emojis(str(snap.get("active_vector_id") or "AUTO"))
+        self.vec_pill.setText(vec_id)
+
+        rx_kbps = float(snap.get("rx_rate_kbps") or 0.0) if self._is_connected else 0.0
+        tx_kbps = float(snap.get("tx_rate_kbps") or 0.0) if self._is_connected else 0.0
+        ping_ms = get_int(snap, "ping_ms", 0) if self._is_connected else 0
+
+        rx_lbl = str(snap.get("rx_rate_label") or "").strip()
+        tx_lbl = str(snap.get("tx_rate_label") or "").strip()
+
+        if (not self._is_connected) or (rx_kbps <= 0.0):
+            self.dl_card.value_lbl.setText("0 B/s")
+            if self.dl_card.sparkline:
+                self.dl_card.sparkline.reset_flat()
+        else:
+            self.dl_card.value_lbl.setText(rx_lbl if rx_lbl else format_rate_kbps(rx_kbps))
+            if self.dl_card.sparkline:
+                self.dl_card.sparkline.push_sample(rx_kbps)
+
+        if (not self._is_connected) or (tx_kbps <= 0.0):
+            self.ul_card.value_lbl.setText("0 B/s")
+            if self.ul_card.sparkline:
+                self.ul_card.sparkline.reset_flat()
+        else:
+            self.ul_card.value_lbl.setText(tx_lbl if tx_lbl else format_rate_kbps(tx_kbps))
+            if self.ul_card.sparkline:
+                self.ul_card.sparkline.push_sample(tx_kbps)
+
+        if (not self._is_connected) or (ping_ms <= 0):
+            self.ping_card.value_lbl.setText("---")
+            if self.ping_card.sparkline:
+                self.ping_card.sparkline.reset_flat()
+        else:
+            self.ping_card.value_lbl.setText(f"{ping_ms} ms")
+            if self.ping_card.sparkline:
+                self.ping_card.sparkline.push_sample(float(ping_ms))
+
+        self._refresh_visual_route()
+
+    def retranslate_ui(self) -> None:
+        self.connect_btn.retranslate_ui()
+        self.out_lbl.setText(I18N.t("output_selector_lbl"))
+        self.ping_out_btn.set_label_text(I18N.t("ping_outputs_btn"))
+        self.clear_out_btn.setToolTip(I18N.t("clear_outputs_tip"))
+        self.lbl_sys_proxy.setText(I18N.t("sw_sys_proxy"))
+        self.lbl_tun.setText(I18N.t("sw_tun_mode"))
+        self.lbl_autopilot.setText(I18N.t("sw_autopilot"))
+        for c in (self.ip_card, self.ping_card, self.dl_card, self.ul_card):
+            c.retranslate_ui()
+        self._rebuild_output_combo()
+        if self._last_snap:
+            self.apply_telemetry(self._last_snap)
+        else:
+            self.headline_lbl.setText(I18N.t("status_idle"))
+            self.detail_lbl.setText(I18N.t("sub_idle"))
+            self._refresh_visual_route()
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
-        self.hunt_best_btn.set_palette_theme(palette)
-        self.inline_task_strip.set_palette_theme(palette)
-        self.refresh_cards(self._items, self._active_idx, self._active_uid)
-        self.refresh_subscriptions(self._subs)
+        self.radar_core.set_palette_theme(palette)
+        self.connect_btn.set_palette_theme(palette)
+        self.chronometer.set_palette_theme(palette)
+        self.route_strip.set_palette_theme(palette)
+        self.dock_card.set_palette_theme(palette)
+        self.ping_out_btn.set_palette_theme(palette)
+        self.clear_out_btn.set_palette_theme(palette)
+        for sw in (self.sw_sys_proxy, self.sw_tun, self.sw_autopilot):
+            sw.set_palette_theme(palette)
+        for c in (self.ip_card, self.ping_card, self.dl_card, self.ul_card):
+            c.set_palette_theme(palette)
 
 
-class SettingsPage(QWidget):
-    settings_updated = Signal(dict)
-    base_switch_toggled = Signal(str, bool)
+class ConfigsPage(QWidget):
+    select_active_requested = Signal(object)
+    import_clipboard_requested = Signal(str, str)
+    new_config_requested = Signal(str)
+    edit_config_requested = Signal(object)
+    delete_configs_requested = Signal(list)
+    ping_configs_requested = Signal(object)
+    probe_gemini_requested = Signal(object)
+    sort_requested = Signal(str)
+    dedup_requested = Signal()
+    remove_dead_requested = Signal()
+    export_verified_requested = Signal()
+    send_batch_to_lab_requested = Signal(list, str)
+    manage_subs_requested = Signal()
 
-    BASE_SWITCH_SLOTS = {
-        "auto_clean_ip": "set_auto_clean_ip",
-        "require_youtube_6s": "set_require_youtube_6s",
-        "verify_upload_stream": "set_verify_upload_stream",
-        "self_healing_watchdog": "set_self_healing_watchdog",
-    }
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._palette: ThemePalette = DARK_PALETTE
+        self._profiles: list[dict] = []
+        self._subscriptions: list[dict] = []
+        self._selected_index = -1
+        self._current_group_key = "__ALL__"
+        self._checked_uids: set[str] = set()
+        self._visible_rows: list[tuple[int, str, dict]] = []
+        self._syncing_table = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 12, 20, 14)
+        root.setSpacing(10)
+
+        hdr = QHBoxLayout()
+        t_col = QVBoxLayout()
+        t_col.setSpacing(2)
+        self.title_lbl = QLabel(I18N.t("vault_title"))
+        self.title_lbl.setObjectName("PageTitle")
+        self.sub_lbl = QLabel(I18N.t("vault_subtitle"))
+        self.sub_lbl.setObjectName("MutedLabel")
+        t_col.addWidget(self.title_lbl)
+        t_col.addWidget(self.sub_lbl)
+
+        self.manage_subs_btn = ActionPillButton("plus", I18N.t("manage_subs_btn"), variant="ghost")
+        self.manage_subs_btn.clicked.connect(self.manage_subs_requested.emit)
+
+        hdr.addLayout(t_col, 1)
+        hdr.addWidget(self.manage_subs_btn)
+        root.addLayout(hdr)
+
+        self.tabs_card = NeuCard(mode="inset", radius=14.0, depth=3.8, pad=3.0)
+        tabs_outer = QHBoxLayout(self.tabs_card)
+        tabs_outer.setContentsMargins(10, 6, 10, 6)
+        tabs_outer.setSpacing(6)
+        self.group_tabs_host = QWidget()
+        self.group_tabs_layout = QHBoxLayout(self.group_tabs_host)
+        self.group_tabs_layout.setContentsMargins(0, 0, 0, 0)
+        self.group_tabs_layout.setSpacing(6)
+        self.group_btn_group = QButtonGroup(self)
+        self.group_btn_group.setExclusive(True)
+        tabs_outer.addWidget(self.group_tabs_host, 1)
+        root.addWidget(self.tabs_card)
+
+        self.toolbar_card = NeuCard(mode="raised", radius=16.0, depth=4.4, pad=5.0)
+        toolbar = QHBoxLayout(self.toolbar_card)
+        toolbar.setContentsMargins(14, 10, 14, 10)
+        toolbar.setSpacing(7)
+
+        self.btn_import = ActionPillButton("plus", I18N.t("import_clip_btn"), variant="ghost")
+        self.btn_import.clicked.connect(self._import_from_clipboard)
+
+        self.btn_new = ActionPillButton("edit", I18N.t("new_config_btn"), variant="ghost")
+        self.btn_new.clicked.connect(self._request_new_in_group)
+
+        self.btn_ping = ActionPillButton("bolt", I18N.t("ping_btn"), variant="ghost")
+        self.btn_ping.clicked.connect(self._ping_selected_or_tab)
+
+        self.btn_gemini = ActionPillButton("gemini", I18N.t("probe_gemini_btn"), variant="emerald")
+        self.btn_gemini.clicked.connect(self._probe_gemini_selected_or_tab)
+
+        self.btn_sort = QPushButton(I18N.t("sort_ping_btn"))
+        self.btn_sort.setObjectName("GhostBtn")
+        self.btn_sort.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sort.clicked.connect(lambda: self.sort_requested.emit("ping"))
+
+        self.btn_dedup = QPushButton(I18N.t("dedup_btn"))
+        self.btn_dedup.setObjectName("GhostBtn")
+        self.btn_dedup.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_dedup.clicked.connect(self.dedup_requested.emit)
+
+        self.btn_rm_dead = QPushButton(I18N.t("remove_dead_btn"))
+        self.btn_rm_dead.setObjectName("DangerBtn")
+        self.btn_rm_dead.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_rm_dead.clicked.connect(self.remove_dead_requested.emit)
+
+        self.btn_send_lab = ActionPillButton("lab", I18N.t("send_to_lab_btn", n=0), variant="gold")
+        self.btn_send_lab.clicked.connect(self._send_checked_or_tab_to_lab)
+
+        toolbar.addWidget(self.btn_import)
+        toolbar.addWidget(self.btn_new)
+        toolbar.addWidget(self.btn_ping)
+        toolbar.addWidget(self.btn_gemini)
+        toolbar.addWidget(self.btn_sort)
+        toolbar.addWidget(self.btn_dedup)
+        toolbar.addWidget(self.btn_rm_dead)
+        toolbar.addStretch()
+        toolbar.addWidget(self.btn_send_lab)
+        root.addWidget(self.toolbar_card)
+
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(10)
+        self.chk_select_all = QCheckBox(I18N.t("col_sel"))
+        self.chk_select_all.toggled.connect(self._on_select_all_toggled)
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText(I18N.t("search_vault_ph"))
+        self.search_edit.textChanged.connect(lambda _t: self._rebuild_table())
+
+        filter_row.addWidget(self.chk_select_all)
+        filter_row.addWidget(self.search_edit, 1)
+        root.addLayout(filter_row)
+
+        self.table = QTableWidget(0, 8)
+        self.table.setObjectName("VaultTable")
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._open_context_menu)
+        self.table.itemChanged.connect(self._on_item_check_changed)
+        self.table.cellDoubleClicked.connect(self._on_row_double_clicked)
+
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(0, 46)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+
+        root.addWidget(self.table, 1)
+
+        QShortcut(QKeySequence("Ctrl+A"), self, activated=self._shortcut_select_all)
+        QShortcut(QKeySequence("Ctrl+V"), self, activated=self._import_from_clipboard)
+        QShortcut(QKeySequence(Qt.Key.Key_Delete), self, activated=self._delete_target_uids)
+
+        self._apply_table_headers()
+        self._rebuild_group_tabs()
+
+    def _apply_table_headers(self) -> None:
+        headers = [
+            I18N.t("col_sel"),
+            I18N.t("col_proto"),
+            I18N.t("col_name"),
+            I18N.t("col_endpoint"),
+            I18N.t("col_group"),
+            I18N.t("col_vector"),
+            I18N.t("col_gemini"),
+            I18N.t("col_ping"),
+        ]
+        self.table.setHorizontalHeaderLabels(headers)
+
+    def known_group_names(self) -> list[str]:
+        names = ["Manual"]
+        for s in self._subscriptions:
+            if isinstance(s, dict):
+                t = strip_emojis(str(s.get("title") or s.get("name") or "")).strip()
+                if t and t not in names:
+                    names.append(t)
+        for p in self._profiles:
+            g = extract_profile_group(p)
+            if g and g not in names:
+                names.append(g)
+        return names
+
+    def active_import_group(self) -> str:
+        if self._current_group_key in ("__ALL__", "Manual"):
+            return "Manual"
+        return self._current_group_key
+
+    def set_subscriptions(self, subs: list) -> None:
+        self._subscriptions = list(subs or [])
+        self._rebuild_group_tabs()
+
+    def set_profiles(self, profiles: list[dict], selected_index: int = -1) -> None:
+        self._profiles = list(profiles or [])
+        self._selected_index = selected_index
+        valid_uids = {extract_profile_uid(p, i) for i, p in enumerate(self._profiles)}
+        self._checked_uids.intersection_update(valid_uids)
+        self._rebuild_group_tabs()
+        self._rebuild_table()
+
+    def _rebuild_group_tabs(self) -> None:
+        counts: dict[str, int] = {"Manual": 0}
+        for g in self.known_group_names():
+            counts.setdefault(g, 0)
+        for p in self._profiles:
+            g = extract_profile_group(p)
+            counts[g] = counts.get(g, 0) + 1
+
+        while self.group_tabs_layout.count():
+            item = self.group_tabs_layout.takeAt(0)
+            if item.widget():
+                self.group_btn_group.removeButton(item.widget())
+                item.widget().deleteLater()
+
+        tab_defs = [("__ALL__", I18N.t("tab_all", n=len(self._profiles)))]
+        tab_defs.append(("Manual", I18N.t("tab_manual", n=counts.get("Manual", 0))))
+        for g_name, cnt in counts.items():
+            if g_name != "Manual":
+                tab_defs.append((g_name, f"{g_name} ({cnt})"))
+
+        valid_keys = {k for k, _ in tab_defs}
+        if self._current_group_key not in valid_keys:
+            self._current_group_key = "__ALL__"
+
+        for key, label in tab_defs:
+            btn = NeuGroupTabButton(label, self._palette, self.group_tabs_host)
+            btn.setChecked(key == self._current_group_key)
+            btn.clicked.connect(lambda _c=False, k=key: self._select_group_tab(k))
+            self.group_btn_group.addButton(btn)
+            self.group_tabs_layout.addWidget(btn)
+
+        self.group_tabs_layout.addStretch()
+
+    def _select_group_tab(self, key: str) -> None:
+        self._current_group_key = key
+        self._rebuild_group_tabs()
+        self._rebuild_table()
+
+    def _rebuild_table(self) -> None:
+        self._syncing_table = True
+        self.table.setUpdatesEnabled(False)
+        try:
+            q = self.search_edit.text().strip().lower()
+            self._visible_rows.clear()
+
+            for idx, p in enumerate(self._profiles):
+                grp = extract_profile_group(p)
+                if (self._current_group_key != "__ALL__") and (grp != self._current_group_key):
+                    continue
+                uid = extract_profile_uid(p, idx)
+                if q:
+                    hay = " ".join(
+                        str(p.get(k) or "")
+                        for k in ("name", "title", "protocol", "host", "original_host", "address", "sni", "cached_vector_id")
+                    ).lower()
+                    if q not in hay and q not in grp.lower():
+                        continue
+                self._visible_rows.append((idx, uid, p))
+
+            self.table.setRowCount(len(self._visible_rows))
+            mono = make_mono_font(10, bold=True)
+            mono_reg = make_mono_font(9, bold=False)
+
+            for row_i, (orig_idx, uid, p) in enumerate(self._visible_rows):
+                self.table.setRowHeight(row_i, 40)
+                is_active = get_bool(p, "is_selected", orig_idx == self._selected_index)
+
+                chk_item = QTableWidgetItem()
+                chk_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+                chk_item.setCheckState(Qt.CheckState.Checked if uid in self._checked_uids else Qt.CheckState.Unchecked)
+                chk_item.setData(Qt.ItemDataRole.UserRole, uid)
+                self.table.setItem(row_i, 0, chk_item)
+
+                proto = str(p.get("protocol") or "VLESS").upper()
+                proto_item = QTableWidgetItem(proto)
+                proto_item.setFont(mono)
+                proto_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                proto_item.setForeground(
+                    QColor(self._palette.accent_primary if self._palette.is_dark else "#B45309")
+                )
+                self.table.setItem(row_i, 1, proto_item)
+
+                raw_name = GeoFlagResolver.clean_display_name(str(p.get("name") or p.get("title") or f"Node #{orig_idx + 1}"))
+                prefix = "* " if is_active else ""
+                cc = GeoFlagResolver.resolve_code(p)
+                name_item = QTableWidgetItem(make_flag_qicon(cc, 24, 16), f"{prefix}{raw_name}")
+                name_item.setFont(make_ui_font(10, QFont.Weight.ExtraBold if is_active else QFont.Weight.DemiBold))
+                if is_active:
+                    name_item.setForeground(QColor(self._palette.emerald))
+                self.table.setItem(row_i, 2, name_item)
+
+                host = str(p.get("host") or p.get("original_host") or p.get("address") or "---")
+                port = get_int(p, "port", 443)
+                ep_txt = f"{host}:{port}" if (host != "---" and ":" not in host) else host
+                ep_item = QTableWidgetItem(ep_txt)
+                ep_item.setFont(mono_reg)
+                ep_item.setForeground(QColor(self._palette.text_secondary))
+                self.table.setItem(row_i, 3, ep_item)
+
+                grp_item = QTableWidgetItem(extract_profile_group(p))
+                grp_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                grp_item.setForeground(QColor(self._palette.text_muted))
+                self.table.setItem(row_i, 4, grp_item)
+
+                vec = str(p.get("cached_vector_id") or p.get("preferred_vector_id") or "AUTO")
+                vec_item = QTableWidgetItem(vec)
+                vec_item.setFont(mono)
+                vec_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                vec_item.setForeground(
+                    QColor(self._palette.cyan) if vec != "AUTO" else QColor(self._palette.text_muted)
+                )
+                self.table.setItem(row_i, 5, vec_item)
+
+                gem_ok = is_gemini_verified(p)
+                raw_gem_st = str(p.get("gemini_status") or "").strip().upper()
+                if gem_ok:
+                    gem_item = QTableWidgetItem(
+                        make_vector_qicon("gemini", self._palette.emerald, 14),
+                        "Gemini",
+                    )
+                    gem_item.setFont(mono)
+                    gem_item.setForeground(QColor(self._palette.emerald))
+                elif raw_gem_st in ("BLOCKED", "FAIL", "FAILED", "NO", "FALSE"):
+                    gem_item = QTableWidgetItem("BLOCKED")
+                    gem_item.setFont(mono_reg)
+                    gem_item.setForeground(QColor(self._palette.danger))
+                else:
+                    gem_item = QTableWidgetItem("---")
+                    gem_item.setFont(mono_reg)
+                    gem_item.setForeground(QColor(self._palette.text_muted))
+                gem_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(row_i, 6, gem_item)
+
+                ping = get_int(p, "ping_ms", 0)
+                st_upper = str(p.get("status") or "").upper()
+                if ping > 0:
+                    ping_txt = f"{ping} ms"
+                    ping_col = (
+                        QColor(self._palette.emerald)
+                        if ping <= 110
+                        else (QColor(self._palette.accent_primary) if ping <= 230 else QColor(self._palette.warning))
+                    )
+                elif st_upper in ("DEAD", "TIMEOUT", "FAILED"):
+                    ping_txt = "TIMEOUT"
+                    ping_col = QColor(self._palette.danger)
+                else:
+                    ping_txt = "---"
+                    ping_col = QColor(self._palette.text_muted)
+
+                ping_item = QTableWidgetItem(ping_txt)
+                ping_item.setFont(mono)
+                ping_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                ping_item.setForeground(ping_col)
+                self.table.setItem(row_i, 7, ping_item)
+
+            self._update_send_lab_caption()
+        finally:
+            self.table.setUpdatesEnabled(True)
+            self._syncing_table = False
+
+    def _effective_target_uids(self) -> list[str]:
+        if self._checked_uids:
+            return [uid for _, uid, _ in self._visible_rows if uid in self._checked_uids]
+        sel_rows = sorted({idx.row() for idx in self.table.selectionModel().selectedRows()})
+        return [self._visible_rows[r][1] for r in sel_rows if 0 <= r < len(self._visible_rows)]
+
+    def _update_send_lab_caption(self) -> None:
+        cnt = len(self._checked_uids)
+        if cnt > 0:
+            self.btn_send_lab.set_label_text(I18N.t("send_to_lab_btn", n=cnt))
+        elif self._current_group_key != "__ALL__":
+            self.btn_send_lab.set_label_text(I18N.t("send_sub_to_lab_btn"))
+        else:
+            self.btn_send_lab.set_label_text(I18N.t("send_to_lab_btn", n=len(self._visible_rows)))
+
+    def _on_item_check_changed(self, item: QTableWidgetItem) -> None:
+        if self._syncing_table or item.column() != 0:
+            return
+        uid = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        if not uid:
+            return
+        if item.checkState() == Qt.CheckState.Checked:
+            self._checked_uids.add(uid)
+        else:
+            self._checked_uids.discard(uid)
+        self._update_send_lab_caption()
+
+    def _on_select_all_toggled(self, checked: bool) -> None:
+        for _, uid, _ in self._visible_rows:
+            if checked:
+                self._checked_uids.add(uid)
+            else:
+                self._checked_uids.discard(uid)
+        self._rebuild_table()
+
+    def _shortcut_select_all(self) -> None:
+        self.chk_select_all.setChecked(True)
+
+    def _on_row_double_clicked(self, row: int, _col: int) -> None:
+        if 0 <= row < len(self._visible_rows):
+            orig_idx, uid, _ = self._visible_rows[row]
+            self.select_active_requested.emit(uid if uid else orig_idx)
+
+    def _import_from_clipboard(self) -> None:
+        clip = QGuiApplication.clipboard().text().strip()
+        if clip:
+            grp = self.active_import_group()
+            self.import_clipboard_requested.emit(clip, grp)
+            self.sub_lbl.setText(I18N.t("vault_feedback_imported", group=grp))
+        else:
+            self.sub_lbl.setText(I18N.t("vault_feedback_empty_clip"))
+
+    def _request_new_in_group(self) -> None:
+        self.new_config_requested.emit(self.active_import_group())
+
+    def _ping_selected_or_tab(self) -> None:
+        targets = self._effective_target_uids()
+        if targets:
+            self.ping_configs_requested.emit(targets)
+        elif self._current_group_key != "__ALL__":
+            tab_uids = [uid for _, uid, _ in self._visible_rows]
+            self.ping_configs_requested.emit(tab_uids)
+        else:
+            self.ping_configs_requested.emit(None)
+
+    def _probe_gemini_selected_or_tab(self) -> None:
+        targets = self._effective_target_uids()
+        if targets:
+            self.probe_gemini_requested.emit(targets)
+        elif self._current_group_key != "__ALL__":
+            tab_uids = [uid for _, uid, _ in self._visible_rows]
+            self.probe_gemini_requested.emit(tab_uids)
+        else:
+            self.probe_gemini_requested.emit(None)
+
+    def _send_checked_or_tab_to_lab(self) -> None:
+        targets = self._effective_target_uids()
+        if targets:
+            self.send_batch_to_lab_requested.emit(targets, "")
+        else:
+            tab_uids = [uid for _, uid, _ in self._visible_rows]
+            grp = "" if self._current_group_key == "__ALL__" else self._current_group_key
+            self.send_batch_to_lab_requested.emit(tab_uids, grp)
+
+    def _delete_target_uids(self) -> None:
+        targets = self._effective_target_uids()
+        if targets:
+            self.delete_configs_requested.emit(targets)
+
+    def _copy_selected_uris(self) -> None:
+        targets = set(self._effective_target_uids())
+        uris = [
+            str(p.get("raw_uri") or p.get("uri") or "")
+            for _, uid, p in self._visible_rows
+            if (uid in targets) and (p.get("raw_uri") or p.get("uri"))
+        ]
+        if uris:
+            QGuiApplication.clipboard().setText("\n".join(uris))
+            self.sub_lbl.setText(I18N.t("vault_feedback_copied"))
+
+    def _open_context_menu(self, pos) -> None:
+        row = self.table.rowAt(pos.y())
+        clicked_uid = ""
+        clicked_orig_idx = -1
+        if 0 <= row < len(self._visible_rows):
+            clicked_orig_idx, clicked_uid, _ = self._visible_rows[row]
+            if not self.table.selectionModel().isRowSelected(row, self.table.rootIndex()):
+                self.table.selectRow(row)
+
+        targets = self._effective_target_uids()
+        if (not targets) and clicked_uid:
+            targets = [clicked_uid]
+
+        menu = QMenu(self)
+        menu.setLayoutDirection(I18N.layout_direction())
+
+        act_active = menu.addAction(I18N.t("ctx_set_active"))
+        act_ping = menu.addAction(I18N.t("ctx_real_ping"))
+        act_gemini = menu.addAction(I18N.t("ctx_check_gemini"))
+        menu.addSeparator()
+        act_lab_sel = menu.addAction(I18N.t("ctx_send_sel_lab"))
+        act_lab_tab = menu.addAction(I18N.t("ctx_send_tab_lab"))
+        menu.addSeparator()
+        act_edit = menu.addAction(I18N.t("ctx_edit"))
+        act_copy = menu.addAction(I18N.t("ctx_copy_uri"))
+        act_export = menu.addAction(I18N.t("ctx_export_verified"))
+        menu.addSeparator()
+        act_del = menu.addAction(I18N.t("ctx_delete_sel"))
+
+        has_single = clicked_orig_idx >= 0
+        act_active.setEnabled(has_single)
+        act_edit.setEnabled(has_single)
+        act_del.setEnabled(bool(targets))
+
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen == act_active and has_single:
+            self.select_active_requested.emit(clicked_uid or clicked_orig_idx)
+        elif chosen == act_ping:
+            self.ping_configs_requested.emit(targets if targets else None)
+        elif chosen == act_gemini:
+            self.probe_gemini_requested.emit(targets if targets else None)
+        elif chosen == act_lab_sel:
+            self.send_batch_to_lab_requested.emit(targets, "")
+        elif chosen == act_lab_tab:
+            tab_uids = [u for _, u, _ in self._visible_rows]
+            grp = "" if self._current_group_key == "__ALL__" else self._current_group_key
+            self.send_batch_to_lab_requested.emit(tab_uids, grp)
+        elif chosen == act_edit and has_single:
+            self.edit_config_requested.emit(clicked_uid or clicked_orig_idx)
+        elif chosen == act_copy:
+            self._copy_selected_uris()
+        elif chosen == act_export:
+            self.export_verified_requested.emit()
+        elif chosen == act_del and targets:
+            self.delete_configs_requested.emit(targets)
+
+    def retranslate_ui(self) -> None:
+        self.title_lbl.setText(I18N.t("vault_title"))
+        self.sub_lbl.setText(I18N.t("vault_subtitle"))
+        self.manage_subs_btn.set_label_text(I18N.t("manage_subs_btn"))
+        self.btn_import.set_label_text(I18N.t("import_clip_btn"))
+        self.btn_new.set_label_text(I18N.t("new_config_btn"))
+        self.btn_ping.set_label_text(I18N.t("ping_btn"))
+        self.btn_gemini.set_label_text(I18N.t("probe_gemini_btn"))
+        self.btn_sort.setText(I18N.t("sort_ping_btn"))
+        self.btn_dedup.setText(I18N.t("dedup_btn"))
+        self.btn_rm_dead.setText(I18N.t("remove_dead_btn"))
+        self.chk_select_all.setText(I18N.t("col_sel"))
+        self.search_edit.setPlaceholderText(I18N.t("search_vault_ph"))
+        self._apply_table_headers()
+        self._rebuild_group_tabs()
+        self._rebuild_table()
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self.tabs_card.set_palette_theme(palette)
+        self.toolbar_card.set_palette_theme(palette)
+        for b in (
+            self.manage_subs_btn,
+            self.btn_import,
+            self.btn_new,
+            self.btn_ping,
+            self.btn_gemini,
+            self.btn_send_lab,
+        ):
+            b.set_palette_theme(palette)
+        self._rebuild_group_tabs()
+        self._rebuild_table()
+
+
+class LabPage(QWidget):
+    start_lab_scan_requested = Signal(str, list, str, str, bool, bool)
+    start_clean_ip_requested = Signal(int)
+    stop_scanner_requested = Signal()
+    connect_winner_requested = Signal(str, str)
+    apply_clean_ip_requested = Signal(str, bool)
+    go_home_requested = Signal()
+
+    CLOUDFLARE_PORTS = [443, 2053, 2083, 2087, 2096, 8443, 80, 8080]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._palette: ThemePalette = DARK_PALETTE
+        self._is_running = False
+        self._batch_uids: list[str] = []
+        self._profiles: list[dict] = []
+        self._groups: list[str] = ["Manual"]
+        self._vectors: list = []
+        self._lab_rows: list[dict] = []
+        self._radar_rows: list[dict] = []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 12, 20, 14)
+        root.setSpacing(10)
+
+        hdr = QHBoxLayout()
+        t_col = QVBoxLayout()
+        t_col.setSpacing(2)
+        self.title_lbl = QLabel(I18N.t("lab_title"))
+        self.title_lbl.setObjectName("PageTitle")
+        self.sub_lbl = QLabel(I18N.t("lab_subtitle"))
+        self.sub_lbl.setObjectName("MutedLabel")
+        t_col.addWidget(self.title_lbl)
+        t_col.addWidget(self.sub_lbl)
+        hdr.addLayout(t_col, 1)
+        root.addLayout(hdr)
+
+        self.mode_seg = SegmentedControl([I18N.t("lab_mode_vectors"), I18N.t("lab_mode_clean_ip")])
+        self.mode_seg.current_changed.connect(self._on_mode_switched)
+        root.addWidget(self.mode_seg)
+
+        self.stack = QStackedWidget()
+        root.addWidget(self.stack, 1)
+
+        vec_page = QWidget()
+        vec_vbox = QVBoxLayout(vec_page)
+        vec_vbox.setContentsMargins(0, 4, 0, 0)
+        vec_vbox.setSpacing(10)
+
+        self.cfg_card = NeuCard(mode="raised", radius=18.0, depth=5.0, pad=6.0)
+        cfg_vbox = QVBoxLayout(self.cfg_card)
+        cfg_vbox.setContentsMargins(18, 15, 18, 15)
+        cfg_vbox.setSpacing(10)
+
+        r1 = QHBoxLayout()
+        r1.setSpacing(10)
+        self.scope_lbl = QLabel(I18N.t("lab_scope_lbl"))
+        self.scope_lbl.setObjectName("SecondaryLabel")
+        self.scope_combo = QComboBox()
+        self.scope_combo.currentIndexChanged.connect(self._sync_scope_selectors)
+
+        self.group_target_combo = QComboBox()
+        self.single_target_combo = QComboBox()
+        self.single_target_combo.setMinimumWidth(200)
+
+        self.method_lbl = QLabel(I18N.t("lab_method_lbl"))
+        self.method_lbl.setObjectName("SecondaryLabel")
+        self.method_combo = QComboBox()
+        self.method_combo.setMinimumWidth(220)
+
+        r1.addWidget(self.scope_lbl)
+        r1.addWidget(self.scope_combo)
+        r1.addWidget(self.group_target_combo)
+        r1.addWidget(self.single_target_combo, 1)
+        r1.addSpacing(10)
+        r1.addWidget(self.method_lbl)
+        r1.addWidget(self.method_combo, 1)
+        cfg_vbox.addLayout(r1)
+
+        r2 = QHBoxLayout()
+        r2.setSpacing(14)
+        self.chk_gemini = QCheckBox(I18N.t("chk_lab_gemini"))
+        self.chk_gemini.setChecked(True)
+
+        self.chk_autoconnect = QCheckBox(I18N.t("chk_lab_autoconnect"))
+        self.chk_autoconnect.setChecked(False)
+
+        self.sw_winners_only = AnimatedToggleSwitch(checked=True)
+        self.sw_winners_only.toggled.connect(lambda _c: self._render_lab_table())
+        self.lbl_winners_only = QLabel(I18N.t("sw_winners_only"))
+        self.lbl_winners_only.setObjectName("SecondaryLabel")
+
+        self.btn_run_lab = ActionPillButton("play", I18N.t("btn_start_lab"), variant="gold")
+        self.btn_run_lab.clicked.connect(self._on_run_or_stop_lab)
+
+        self.btn_go_home = ActionPillButton("check", I18N.t("btn_promote_home", n=0), variant="emerald")
+        self.btn_go_home.clicked.connect(self.go_home_requested.emit)
+
+        r2.addWidget(self.chk_gemini)
+        r2.addWidget(self.chk_autoconnect)
+        r2.addSpacing(8)
+        r2.addWidget(self.sw_winners_only)
+        r2.addWidget(self.lbl_winners_only)
+        r2.addStretch()
+        r2.addWidget(self.btn_go_home)
+        r2.addWidget(self.btn_run_lab)
+        cfg_vbox.addLayout(r2)
+        vec_vbox.addWidget(self.cfg_card)
+
+        self.lab_table = QTableWidget(0, 7)
+        self.lab_table.setObjectName("VaultTable")
+        self.lab_table.setAlternatingRowColors(True)
+        self.lab_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.lab_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.lab_table.verticalHeader().setVisible(False)
+        lh = self.lab_table.horizontalHeader()
+        lh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        lh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        lh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        lh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        lh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        lh.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        lh.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        self.lab_table.setColumnWidth(6, 130)
+        vec_vbox.addWidget(self.lab_table, 1)
+
+        radar_page = QWidget()
+        rad_vbox = QVBoxLayout(radar_page)
+        rad_vbox.setContentsMargins(0, 4, 0, 0)
+        rad_vbox.setSpacing(10)
+
+        self.rad_bar = NeuCard(mode="raised", radius=18.0, depth=5.0, pad=6.0)
+        rad_row = QHBoxLayout(self.rad_bar)
+        rad_row.setContentsMargins(18, 14, 18, 14)
+        rad_row.setSpacing(10)
+
+        self.radar_port_lbl = QLabel(I18N.t("radar_port_lbl"))
+        self.radar_port_lbl.setObjectName("SecondaryLabel")
+        self.radar_port_combo = QComboBox()
+        for pt in self.CLOUDFLARE_PORTS:
+            self.radar_port_combo.addItem(str(pt), pt)
+        enforce_english_ltr(self.radar_port_combo, mono_size=10, bold=True)
+
+        self.btn_run_radar = ActionPillButton("play", I18N.t("btn_start_radar"), variant="gold")
+        self.btn_run_radar.clicked.connect(self._on_run_or_stop_radar)
+
+        self.btn_apply_sel_ip = QPushButton(I18N.t("btn_apply_sel_cdn"))
+        self.btn_apply_sel_ip.setObjectName("GhostBtn")
+        self.btn_apply_sel_ip.clicked.connect(lambda: self._apply_selected_radar_ip(False))
+
+        self.btn_apply_all_ip = QPushButton(I18N.t("btn_apply_all_cdn"))
+        self.btn_apply_all_ip.setObjectName("EmeraldBtn")
+        self.btn_apply_all_ip.clicked.connect(lambda: self._apply_selected_radar_ip(True))
+
+        rad_row.addWidget(self.radar_port_lbl)
+        rad_row.addWidget(self.radar_port_combo)
+        rad_row.addWidget(self.btn_run_radar)
+        rad_row.addStretch()
+        rad_row.addWidget(self.btn_apply_sel_ip)
+        rad_row.addWidget(self.btn_apply_all_ip)
+        rad_vbox.addWidget(self.rad_bar)
+
+        self.radar_table = QTableWidget(0, 6)
+        self.radar_table.setObjectName("VaultTable")
+        self.radar_table.setAlternatingRowColors(True)
+        self.radar_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.radar_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.radar_table.verticalHeader().setVisible(False)
+        rh = self.radar_table.horizontalHeader()
+        rh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        rh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        rh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        rh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        rh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        rh.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        rad_vbox.addWidget(self.radar_table, 1)
+
+        self.stack.addWidget(vec_page)
+        self.stack.addWidget(radar_page)
+
+        self._populate_scope_combo()
+        self.set_vectors([])
+        self._apply_table_headers()
+        self._sync_scope_selectors()
+
+    def _populate_scope_combo(self) -> None:
+        prev_scope = self.scope_combo.currentData() or "single"
+        with QSignalBlocker(self.scope_combo):
+            self.scope_combo.clear()
+            self.scope_combo.addItem(I18N.t("scope_batch", n=len(self._batch_uids)), "selected")
+            self.scope_combo.addItem(I18N.t("scope_sub"), "group")
+            self.scope_combo.addItem(I18N.t("scope_single"), "single")
+            i_s = self.scope_combo.findData(prev_scope)
+            if i_s >= 0:
+                self.scope_combo.setCurrentIndex(i_s)
+
+    def set_vectors(self, vectors: list) -> None:
+        self._vectors = list(vectors or [])
+        prev_val = str(self.method_combo.currentData() or "ALL")
+        with QSignalBlocker(self.method_combo):
+            self.method_combo.clear()
+            self.method_combo.addItem(I18N.t("method_all"), "ALL")
+            for vid, vlabel in normalize_vector_entries(self._vectors):
+                self.method_combo.addItem(vlabel, vid)
+            idx = self.method_combo.findData(prev_val)
+            self.method_combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+    def _apply_table_headers(self) -> None:
+        self.lab_table.setHorizontalHeaderLabels(
+            [
+                I18N.t("lab_col_rank"),
+                I18N.t("lab_col_profile"),
+                I18N.t("lab_col_vector"),
+                I18N.t("lab_col_ping"),
+                I18N.t("lab_col_upload"),
+                I18N.t("lab_col_status"),
+                I18N.t("lab_col_action"),
+            ]
+        )
+        self.radar_table.setHorizontalHeaderLabels(
+            [
+                I18N.t("lab_col_rank"),
+                I18N.t("radar_col_ip"),
+                I18N.t("radar_col_tcp"),
+                I18N.t("radar_col_tls"),
+                I18N.t("radar_col_score"),
+                I18N.t("lab_col_status"),
+            ]
+        )
+
+    def _on_mode_switched(self, idx: int) -> None:
+        self.stack.setCurrentIndex(idx)
+
+    def _sync_scope_selectors(self, *_args) -> None:
+        scope = str(self.scope_combo.currentData() or "single")
+        self.group_target_combo.setVisible(scope == "group")
+        self.single_target_combo.setVisible(scope == "single")
+
+    def set_profiles_and_groups(self, profiles: list[dict], groups: list[str], selected_index: int = -1) -> None:
+        self._profiles = list(profiles or [])
+        self._groups = list(groups or ["Manual"])
+
+        self.group_target_combo.clear()
+        for g in self._groups:
+            self.group_target_combo.addItem(g, g)
+
+        self.single_target_combo.clear()
+        for idx, p in enumerate(self._profiles):
+            uid = extract_profile_uid(p, idx)
+            name = GeoFlagResolver.clean_display_name(str(p.get("name") or f"Node #{idx + 1}"))
+            cc = GeoFlagResolver.resolve_code(p)
+            self.single_target_combo.addItem(
+                make_flag_qicon(cc, 22, 15),
+                f"{name} ({str(p.get('protocol') or 'VLESS').upper()})",
+                uid,
+            )
+        if 0 <= selected_index < len(self._profiles):
+            self.single_target_combo.setCurrentIndex(selected_index)
+
+    def receive_vault_batch(self, uid_list: list[str], group_tag: str = "") -> None:
+        self.mode_seg.set_current_index(0, emit_signal=True)
+        if group_tag and (not uid_list or len(uid_list) > 1):
+            self._batch_uids = list(uid_list)
+            self._populate_scope_combo()
+            idx_g = self.group_target_combo.findData(group_tag)
+            if idx_g >= 0:
+                self.group_target_combo.setCurrentIndex(idx_g)
+            idx_sc = self.scope_combo.findData("group")
+            if idx_sc >= 0:
+                self.scope_combo.setCurrentIndex(idx_sc)
+        else:
+            self._batch_uids = list(uid_list)
+            self._populate_scope_combo()
+            idx_sc = self.scope_combo.findData("selected")
+            if idx_sc >= 0:
+                self.scope_combo.setCurrentIndex(idx_sc)
+        self._sync_scope_selectors()
+
+    def _on_run_or_stop_lab(self) -> None:
+        if self._is_running:
+            self.stop_scanner_requested.emit()
+            return
+        self._lab_rows.clear()
+        self._render_lab_table()
+
+        scope = str(self.scope_combo.currentData() or "single")
+        selected_vector_id = str(self.method_combo.currentData() or "ALL")
+        chk_gem = bool(self.chk_gemini.isChecked())
+        auto_conn = bool(self.chk_autoconnect.isChecked())
+
+        if scope == "selected":
+            uids = list(self._batch_uids)
+            grp = ""
+        elif scope == "group":
+            uids = []
+            grp = str(self.group_target_combo.currentData() or "Manual")
+        else:
+            cur_uid = str(self.single_target_combo.currentData() or "")
+            uids = [cur_uid] if cur_uid else []
+            grp = ""
+
+        self.start_lab_scan_requested.emit(scope, uids, grp, selected_vector_id, chk_gem, auto_conn)
+
+    def _on_run_or_stop_radar(self) -> None:
+        if self._is_running:
+            self.stop_scanner_requested.emit()
+            return
+        self._radar_rows.clear()
+        self._render_radar_table()
+        port = int(self.radar_port_combo.currentData() or 443)
+        self.start_clean_ip_requested.emit(port)
+
+    def update_scan_state(self, is_running: bool, _mode: str = "") -> None:
+        self._is_running = bool(is_running)
+        if self._is_running:
+            self.btn_run_lab.set_label_text(I18N.t("btn_stop_lab"))
+            self.btn_run_radar.set_label_text(I18N.t("btn_stop_lab"))
+        else:
+            self.btn_run_lab.set_label_text(I18N.t("btn_start_lab"))
+            self.btn_run_radar.set_label_text(I18N.t("btn_start_radar"))
+
+    def append_scan_row(self, row: dict) -> None:
+        st_type = str(row.get("scan_type") or "").lower()
+        if st_type in ("clean_ip", "clean_ip_radar", "radar"):
+            key = str(row.get("item_id") or row.get("ip") or row.get("endpoint") or "")
+            replaced = False
+            for idx, existing in enumerate(self._radar_rows):
+                if str(existing.get("item_id") or existing.get("ip") or "") == key and key:
+                    self._radar_rows[idx] = dict(row)
+                    replaced = True
+                    break
+            if not replaced:
+                self._radar_rows.append(dict(row))
+            self._render_radar_table()
+        else:
+            key = f"{row.get('target_uid', '')}:{row.get('vector_id', row.get('item_id', ''))}"
+            replaced = False
+            for idx, existing in enumerate(self._lab_rows):
+                ek = f"{existing.get('target_uid', '')}:{existing.get('vector_id', existing.get('item_id', ''))}"
+                if ek == key and key != ":":
+                    self._lab_rows[idx] = dict(row)
+                    replaced = True
+                    break
+            if not replaced:
+                self._lab_rows.append(dict(row))
+            self._render_lab_table()
+
+    def apply_ranked_rows(self, rows: list[dict]) -> None:
+        if not rows:
+            return
+        first_t = str(rows[0].get("scan_type") or "").lower()
+        if first_t in ("clean_ip", "clean_ip_radar", "radar"):
+            self._radar_rows = [dict(r) for r in rows]
+            self._render_radar_table()
+        else:
+            self._lab_rows = [dict(r) for r in rows]
+            self._render_lab_table()
+
+    @staticmethod
+    def _is_verified_row(row: dict) -> bool:
+        if get_bool(row, "verified", False) or get_bool(row, "passed", False):
+            return True
+        st = str(row.get("status") or "").upper()
+        return st in ("VERIFIED", "TRUE", "PASSED", "OK", "CLEAN")
+
+    def _render_lab_table(self) -> None:
+        self.lab_table.setUpdatesEnabled(False)
+        try:
+            winners_only = self.sw_winners_only.isChecked()
+            verified_count = sum(1 for r in self._lab_rows if self._is_verified_row(r))
+            self.btn_go_home.set_label_text(I18N.t("btn_promote_home", n=verified_count))
+
+            shown = [r for r in self._lab_rows if (not winners_only) or self._is_verified_row(r)]
+            self.lab_table.setRowCount(len(shown))
+            mono = make_mono_font(10, bold=True)
+
+            for r_idx, row in enumerate(shown):
+                self.lab_table.setRowHeight(r_idx, 40)
+                is_ok = self._is_verified_row(row)
+
+                rank_str = str(row.get("rank") or f"#{r_idx + 1}")
+                if not rank_str.startswith("#"):
+                    rank_str = f"#{rank_str}"
+                rk_item = QTableWidgetItem(rank_str)
+                rk_item.setFont(mono)
+                rk_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                rk_item.setForeground(
+                    QColor(self._palette.accent_primary if self._palette.is_dark else "#B45309")
+                    if r_idx == 0
+                    else QColor(self._palette.text_secondary)
+                )
+                self.lab_table.setItem(r_idx, 0, rk_item)
+
+                title = GeoFlagResolver.clean_display_name(
+                    str(row.get("title") or row.get("profile_name") or row.get("item_id") or "Config")
+                )
+                cc = GeoFlagResolver.resolve_code(row)
+                prof_item = QTableWidgetItem(make_flag_qicon(cc, 22, 15), title)
+                prof_item.setFont(make_ui_font(10, QFont.Weight.Bold))
+                self.lab_table.setItem(r_idx, 1, prof_item)
+
+                vec = str(row.get("vector_id") or row.get("bound_vector") or row.get("category") or "AUTO")
+                vec_item = QTableWidgetItem(vec)
+                vec_item.setFont(mono)
+                vec_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                vec_item.setForeground(QColor(self._palette.cyan))
+                self.lab_table.setItem(r_idx, 2, vec_item)
+
+                ping = get_int(row, "tunnel_ms", get_int(row, "ping_ms", 0))
+                p_item = QTableWidgetItem(f"{ping} ms" if ping > 0 else "---")
+                p_item.setFont(mono)
+                p_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                p_item.setForeground(
+                    QColor(self._palette.emerald) if ping > 0 else QColor(self._palette.text_muted)
+                )
+                self.lab_table.setItem(r_idx, 3, p_item)
+
+                up_ok = get_bool(row, "upload_ok", is_ok)
+                gem = is_gemini_verified(row)
+                up_str = f"UL:{'OK' if up_ok else '---'} | {'Gemini' if gem else 'AI:---'}"
+                up_item = QTableWidgetItem(up_str)
+                up_item.setFont(make_mono_font(9))
+                up_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                up_item.setForeground(
+                    QColor(self._palette.emerald) if gem else QColor(self._palette.text_secondary)
+                )
+                self.lab_table.setItem(r_idx, 4, up_item)
+
+                verdict = "TRUE (VERIFIED)" if is_ok else str(row.get("status") or "FAILED").upper()
+                v_item = QTableWidgetItem(verdict)
+                v_item.setFont(mono)
+                v_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                v_item.setForeground(QColor(self._palette.emerald) if is_ok else QColor(self._palette.danger))
+                self.lab_table.setItem(r_idx, 5, v_item)
+
+                target_uid = str(row.get("target_uid") or row.get("uid") or "")
+                btn_conn = QPushButton(I18N.t("btn_connect_now"))
+                btn_conn.setObjectName("EmeraldBtn" if is_ok else "GhostBtn")
+                btn_conn.setEnabled(is_ok)
+                btn_conn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn_conn.clicked.connect(
+                    lambda _c=False, v=vec, u=target_uid: self.connect_winner_requested.emit(v, u)
+                )
+                cell_w = QWidget()
+                cl = QHBoxLayout(cell_w)
+                cl.setContentsMargins(6, 4, 6, 4)
+                cl.addWidget(btn_conn)
+                self.lab_table.setCellWidget(r_idx, 6, cell_w)
+        finally:
+            self.lab_table.setUpdatesEnabled(True)
+
+    def _render_radar_table(self) -> None:
+        self.radar_table.setUpdatesEnabled(False)
+        try:
+            self.radar_table.setRowCount(len(self._radar_rows))
+            mono = make_mono_font(10, bold=True)
+            for idx, row in enumerate(self._radar_rows):
+                self.radar_table.setRowHeight(idx, 38)
+                ip_txt = str(row.get("ip") or row.get("item_id") or row.get("endpoint") or "").split(":")[0]
+                tcp = get_int(row, "tcp_ms", 0)
+                tls = get_int(row, "tunnel_ms", get_int(row, "tls_ms", 0))
+                score = float(row.get("score") or 0.0)
+                st = str(row.get("status") or "CLEAN").upper()
+
+                vals = [
+                    f"#{idx + 1}",
+                    ip_txt,
+                    f"{tcp} ms" if tcp > 0 else "---",
+                    f"{tls} ms" if tls > 0 else "---",
+                    f"{score:.1f}",
+                    st,
+                ]
+                for c_i, txt in enumerate(vals):
+                    it = QTableWidgetItem(txt)
+                    it.setFont(mono)
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    if c_i == 1:
+                        it.setData(Qt.ItemDataRole.UserRole, ip_txt)
+                        it.setForeground(
+                            QColor(self._palette.accent_primary if self._palette.is_dark else "#B45309")
+                        )
+                    elif c_i == 5:
+                        it.setForeground(QColor(self._palette.emerald))
+                    self.radar_table.setItem(idx, c_i, it)
+        finally:
+            self.radar_table.setUpdatesEnabled(True)
+
+    def _apply_selected_radar_ip(self, apply_all_cdn: bool) -> None:
+        sel = self.radar_table.currentRow()
+        if sel < 0 and self.radar_table.rowCount() > 0:
+            sel = 0
+        if sel >= 0:
+            it = self.radar_table.item(sel, 1)
+            if it is not None:
+                ip_addr = str(it.data(Qt.ItemDataRole.UserRole) or it.text()).strip()
+                if ip_addr:
+                    self.apply_clean_ip_requested.emit(ip_addr, apply_all_cdn)
+
+    def retranslate_ui(self) -> None:
+        self.title_lbl.setText(I18N.t("lab_title"))
+        self.sub_lbl.setText(I18N.t("lab_subtitle"))
+        self.mode_seg.update_labels([I18N.t("lab_mode_vectors"), I18N.t("lab_mode_clean_ip")])
+        self.scope_lbl.setText(I18N.t("lab_scope_lbl"))
+        self.method_lbl.setText(I18N.t("lab_method_lbl"))
+        self._populate_scope_combo()
+        self.set_vectors(self._vectors)
+        self.chk_gemini.setText(I18N.t("chk_lab_gemini"))
+        self.chk_autoconnect.setText(I18N.t("chk_lab_autoconnect"))
+        self.lbl_winners_only.setText(I18N.t("sw_winners_only"))
+        self.radar_port_lbl.setText(I18N.t("radar_port_lbl"))
+        self.btn_apply_sel_ip.setText(I18N.t("btn_apply_sel_cdn"))
+        self.btn_apply_all_ip.setText(I18N.t("btn_apply_all_cdn"))
+        self.update_scan_state(self._is_running)
+        self._apply_table_headers()
+        self._render_lab_table()
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self.mode_seg.set_palette_theme(palette)
+        self.cfg_card.set_palette_theme(palette)
+        self.rad_bar.set_palette_theme(palette)
+        self.sw_winners_only.set_palette_theme(palette)
+        for b in (self.btn_run_lab, self.btn_go_home, self.btn_run_radar):
+            b.set_palette_theme(palette)
+        self._render_lab_table()
+        self._render_radar_table()
+
+
+class RoutingSettingsPage(QWidget):
+    settings_changed = Signal(dict)
+    setting_key_changed = Signal(str, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._palette: ThemePalette = DARK_PALETTE
         self._updating = False
-        self._controller = None
+        self._domains_as_list = False
         self._switches: list[AnimatedToggleSwitch] = []
+        self._neu_cards: list[NeuCard] = []
+        self._switch_labels: list[tuple[QLabel, str, QLabel | None, str | None]] = []
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(20, 12, 20, 16)
-        outer.setSpacing(12)
+        self._domain_debounce = QTimer(self)
+        self._domain_debounce.setSingleShot(True)
+        self._domain_debounce.setInterval(450)
+        self._domain_debounce.timeout.connect(self._emit_all)
 
-        hdr = QVBoxLayout()
-        t_lbl = QLabel("تنظیمات هوشمند و پیکربندی موتور")
-        t_lbl.setFont(make_ui_font(15, QFont.Weight.ExtraBold))
-        d_lbl = QLabel("پایش خودکار به صورت پیش‌فرض فعال است؛ پارامترهای سطح پایین در پنل بازشونده قرار دارند.")
-        d_lbl.setObjectName("MutedLabel")
-        hdr.addWidget(t_lbl)
-        hdr.addWidget(d_lbl)
-        outer.addLayout(hdr)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 12, 20, 14)
+        root.setSpacing(10)
 
-        body = QWidget()
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(0, 4, 6, 10)
-        body_layout.setSpacing(14)
+        t_col = QVBoxLayout()
+        t_col.setSpacing(2)
+        self.title_lbl = QLabel(I18N.t("settings_title"))
+        self.title_lbl.setObjectName("PageTitle")
+        self.sub_lbl = QLabel(I18N.t("settings_subtitle"))
+        self.sub_lbl.setObjectName("MutedLabel")
+        t_col.addWidget(self.title_lbl)
+        t_col.addWidget(self.sub_lbl)
+        root.addLayout(t_col)
 
-        base_card = QFrame()
-        base_card.setObjectName("GlassCard")
-        base_vbox = QVBoxLayout(base_card)
-        base_vbox.setContentsMargins(18, 16, 18, 16)
-        base_vbox.setSpacing(14)
-
-        sec_hdr = QLabel("تنظیمات پایه و پایش خودکار")
-        sec_hdr.setFont(make_ui_font(11, QFont.Weight.Bold))
-        base_vbox.addWidget(sec_hdr)
-
-        self.sw_auto_clean_ip = self._add_base_switch_row(
-            base_vbox,
-            "auto_clean_ip",
-            "یافتن خودکار IP تمیز از چند رنج (Auto Clean IP)",
-            "جایگزینی خودکار آدرس خروجی با کم‌تاخیرترین IP سالم پیش از برقراری تونل",
-            True,
+        self.sub_tabs = SegmentedControl(
+            [I18N.t("stab_routing"), I18N.t("stab_behavior"), I18N.t("stab_core")]
         )
-        self.sw_youtube_6s = self._add_base_switch_row(
-            base_vbox,
-            "require_youtube_6s",
-            "تست بقای ۶ ثانیه‌ای استریم یوتیوب",
-            "تایید پایداری واقعی تبادل داده پس از هندشیک اولیه برای جلوگیری از فریز تصویر",
-            True,
-        )
-        self.sw_upload_stream = self._add_base_switch_row(
-            base_vbox,
-            "verify_upload_stream",
-            "ارزیابی سلامت جریان آپلود",
-            "سنجش عبور بدون اختلال درخواست‌های حجیم خروجی روی مسیر انتخاب‌شده",
-            True,
-        )
-        self.sw_watchdog = self._add_base_switch_row(
-            base_vbox,
-            "self_healing_watchdog",
-            "نگهبان ترمیم خودکار اتصال در پس‌زمینه (Self-Healing Watchdog)",
-            "پایش پیوسته کیفیت تونل و سوییچ بی‌وقفه در صورت افت سرعت یا قطع مسیر",
-            True,
-        )
-        body_layout.addWidget(base_card)
+        self.sub_tabs.current_changed.connect(lambda idx: self.stack.setCurrentIndex(idx))
+        root.addWidget(self.sub_tabs)
 
-        self.adv_accordion = CollapsibleAccordion(
-            title="تنظیمات پیشرفته هسته و فرگمنت",
-            subtitle="حالت موتور، فرگمنت بومی Xray، اثرانگشت TLS، مالتی‌پلکسینگ و پورت‌های محلی",
-            expanded=False,
-        )
-        adv = self.adv_accordion.body_layout
+        self.stack = QStackedWidget()
+        root.addWidget(self.stack, 1)
 
-        mode_row = QHBoxLayout()
-        mode_lbl = QLabel("حالت عملیاتی موتور:")
-        mode_lbl.setObjectName("SecondaryLabel")
+        self.stack.addWidget(self._build_routing_tab())
+        self.stack.addWidget(self._build_behavior_tab())
+        self.stack.addWidget(self._build_core_tab())
+
+    def _build_routing_tab(self) -> QWidget:
+        host = QWidget()
+        vbox = QVBoxLayout(host)
+        vbox.setContentsMargins(0, 4, 6, 8)
+        vbox.setSpacing(12)
+
+        card = NeuCard(mode="raised", radius=18.0, depth=5.2, pad=6.5)
+        self._neu_cards.append(card)
+        cv = QVBoxLayout(card)
+        cv.setContentsMargins(20, 18, 20, 18)
+        cv.setSpacing(12)
+
+        rm_row = QHBoxLayout()
+        self.lbl_rmode = QLabel(I18N.t("routing_mode_lbl"))
+        self.lbl_rmode.setObjectName("SecondaryLabel")
+        self.routing_mode_combo = QComboBox()
+        self.routing_mode_combo.currentIndexChanged.connect(self._emit_all)
+        rm_row.addWidget(self.lbl_rmode)
+        rm_row.addWidget(self.routing_mode_combo, 1)
+        cv.addLayout(rm_row)
+
+        self.sw_block_quic = self._add_switch_item(
+            cv, "block_quic", "sw_block_quic", "sw_block_quic_desc", True
+        )
+
+        dns_grid = QGridLayout()
+        dns_grid.setHorizontalSpacing(14)
+        dns_grid.setVerticalSpacing(6)
+        self.lbl_remote_dns = QLabel(I18N.t("remote_dns_lbl"))
+        self.lbl_remote_dns.setObjectName("SecondaryLabel")
+        self.remote_dns_edit = QLineEdit("https://1.1.1.1/dns-query")
+        enforce_english_ltr(self.remote_dns_edit, mono_size=10)
+        self.remote_dns_edit.editingFinished.connect(self._emit_all)
+
+        self.lbl_dom_dns = QLabel(I18N.t("domestic_dns_lbl"))
+        self.lbl_dom_dns.setObjectName("SecondaryLabel")
+        self.domestic_dns_edit = QLineEdit("178.22.122.100")
+        enforce_english_ltr(self.domestic_dns_edit, mono_size=10)
+        self.domestic_dns_edit.editingFinished.connect(self._emit_all)
+
+        dns_grid.addWidget(self.lbl_remote_dns, 0, 0)
+        dns_grid.addWidget(self.lbl_dom_dns, 0, 1)
+        dns_grid.addWidget(self.remote_dns_edit, 1, 0)
+        dns_grid.addWidget(self.domestic_dns_edit, 1, 1)
+        cv.addLayout(dns_grid)
+
+        rules_grid = QGridLayout()
+        rules_grid.setHorizontalSpacing(12)
+        rules_grid.setVerticalSpacing(6)
+
+        self.lbl_direct_dom = QLabel(I18N.t("direct_domains_lbl"))
+        self.lbl_direct_dom.setObjectName("SecondaryLabel")
+        self.direct_domains_edit = QPlainTextEdit("geosite:ir\ngeoip:ir\ngeoip:private")
+        self.direct_domains_edit.setObjectName("CodeEditor")
+        self.direct_domains_edit.setMaximumHeight(95)
+        enforce_english_ltr(self.direct_domains_edit, mono_size=9)
+        self.direct_domains_edit.textChanged.connect(self._schedule_domain_emit)
+
+        self.lbl_proxy_dom = QLabel(I18N.t("proxy_domains_lbl"))
+        self.lbl_proxy_dom.setObjectName("SecondaryLabel")
+        self.proxy_domains_edit = QPlainTextEdit("geosite:google\ngeosite:youtube\n*.gemini.google.com")
+        self.proxy_domains_edit.setObjectName("CodeEditor")
+        self.proxy_domains_edit.setMaximumHeight(95)
+        enforce_english_ltr(self.proxy_domains_edit, mono_size=9)
+        self.proxy_domains_edit.textChanged.connect(self._schedule_domain_emit)
+
+        self.lbl_block_dom = QLabel(I18N.t("blocked_domains_lbl"))
+        self.lbl_block_dom.setObjectName("SecondaryLabel")
+        self.blocked_domains_edit = QPlainTextEdit("geosite:category-ads-all")
+        self.blocked_domains_edit.setObjectName("CodeEditor")
+        self.blocked_domains_edit.setMaximumHeight(95)
+        enforce_english_ltr(self.blocked_domains_edit, mono_size=9)
+        self.blocked_domains_edit.textChanged.connect(self._schedule_domain_emit)
+
+        rules_grid.addWidget(self.lbl_direct_dom, 0, 0)
+        rules_grid.addWidget(self.lbl_proxy_dom, 0, 1)
+        rules_grid.addWidget(self.lbl_block_dom, 0, 2)
+        rules_grid.addWidget(self.direct_domains_edit, 1, 0)
+        rules_grid.addWidget(self.proxy_domains_edit, 1, 1)
+        rules_grid.addWidget(self.blocked_domains_edit, 1, 2)
+        cv.addLayout(rules_grid)
+
+        vbox.addWidget(card)
+        vbox.addStretch()
+        self._populate_routing_combos()
+        return make_transparent_scroll_area(host)
+
+    def _build_behavior_tab(self) -> QWidget:
+        host = QWidget()
+        vbox = QVBoxLayout(host)
+        vbox.setContentsMargins(0, 4, 6, 8)
+        vbox.setSpacing(12)
+
+        card = NeuCard(mode="raised", radius=18.0, depth=5.2, pad=6.5)
+        self._neu_cards.append(card)
+        cv = QVBoxLayout(card)
+        cv.setContentsMargins(22, 18, 22, 18)
+        cv.setSpacing(14)
+
+        self.sw_min_tray = self._add_switch_item(
+            cv, "minimize_to_tray", "sw_min_tray", "sw_min_tray_desc", True
+        )
+        self.sw_pool_fallback = self._add_switch_item(
+            cv, "auto_pool_fallback", "sw_pool_fallback", "sw_pool_fallback_desc", True
+        )
+        self.sw_yt_guard = self._add_switch_item(
+            cv, "require_youtube_6s", "sw_yt_guard", "sw_yt_guard_desc", True
+        )
+        self.sw_upload_burst = self._add_switch_item(
+            cv, "verify_upload_stream", "sw_upload_burst", "sw_upload_burst_desc", True
+        )
+        self.sw_watchdog = self._add_switch_item(
+            cv, "self_healing_watchdog", "sw_watchdog", "sw_watchdog_desc", True
+        )
+
+        sub_row = QHBoxLayout()
+        self.lbl_sub_hrs = QLabel(I18N.t("sub_autoupdate_lbl"))
+        self.lbl_sub_hrs.setObjectName("SecondaryLabel")
+        self.sub_hours_combo = QComboBox()
+        self.sub_hours_combo.currentIndexChanged.connect(self._on_sub_hours_combo_changed)
+        sub_row.addWidget(self.lbl_sub_hrs)
+        sub_row.addWidget(self.sub_hours_combo, 1)
+        cv.addLayout(sub_row)
+
+        vbox.addWidget(card)
+        vbox.addStretch()
+        self._populate_behavior_combos()
+        return make_transparent_scroll_area(host)
+
+    def _build_core_tab(self) -> QWidget:
+        host = QWidget()
+        vbox = QVBoxLayout(host)
+        vbox.setContentsMargins(0, 4, 6, 8)
+        vbox.setSpacing(12)
+
+        card = NeuCard(mode="raised", radius=18.0, depth=5.2, pad=6.5)
+        self._neu_cards.append(card)
+        grid = QGridLayout(card)
+        grid.setContentsMargins(20, 18, 20, 20)
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(8)
+
         self.engine_mode_combo = QComboBox()
-        self.engine_mode_combo.addItem("ترکیبی هوشمند خودکار (Auto Hybrid)", "auto_hybrid")
-        self.engine_mode_combo.addItem("فقط فرگمنت بومی (Fragment Only)", "fragment_only")
-        self.engine_mode_combo.addItem("فقط موتور اختصاصی هسته (Core Engine Only)", "proprietary_only")
-        mode_row.addWidget(mode_lbl)
-        mode_row.addWidget(self.engine_mode_combo, 1)
-        adv.addLayout(mode_row)
+        self.manual_vec_combo = QComboBox()
+        enforce_english_ltr(self.manual_vec_combo, mono_size=10, bold=True)
+        self.set_vectors([])
 
-        frag_box = QFrame()
-        frag_box.setObjectName("SubtleCard")
-        frag_vbox = QVBoxLayout(frag_box)
-        frag_vbox.setContentsMargins(14, 12, 14, 12)
-        frag_vbox.setSpacing(10)
+        frag_hdr_w = QWidget()
+        fh_row = QHBoxLayout(frag_hdr_w)
+        fh_row.setContentsMargins(0, 0, 0, 0)
+        self.sw_frag = AnimatedToggleSwitch(checked=True)
+        self.sw_frag.toggled.connect(lambda c: self._on_single_switch("fragment_enabled", c))
+        self._switches.append(self.sw_frag)
+        self.lbl_sw_frag = QLabel(I18N.t("sw_native_frag"))
+        self.lbl_sw_frag.setObjectName("SecondaryLabel")
+        fh_row.addWidget(self.sw_frag)
+        fh_row.addWidget(self.lbl_sw_frag, 1)
 
-        frag_top = QHBoxLayout()
-        frag_title = QLabel("فرگمنت بومی Xray (Native Fragment)")
-        frag_title.setFont(make_ui_font(10, QFont.Weight.Bold))
-        self.sw_fragment_enabled = AnimatedToggleSwitch(checked=True)
-        self.sw_fragment_enabled.toggled.connect(self._emit_changes)
-        self._switches.append(self.sw_fragment_enabled)
-
-        btn_preset_micro = QPushButton("پروفایل فرگمنت میکرو ۵-۱۶")
-        btn_preset_micro.setObjectName("GhostPillBtn")
-        btn_preset_micro.clicked.connect(lambda: self._apply_fragment_preset("tlshello", "5-16", "2-3"))
-
-        btn_preset_win5 = QPushButton("پروفایل پنجره ۵ بایتی")
-        btn_preset_win5.setObjectName("GhostPillBtn")
-        btn_preset_win5.clicked.connect(lambda: self._apply_fragment_preset("1-3", "5-5", "15-25"))
-
-        frag_top.addWidget(frag_title)
-        frag_top.addSpacing(8)
-        frag_top.addWidget(self.sw_fragment_enabled)
-        frag_top.addStretch()
-        frag_top.addWidget(btn_preset_micro)
-        frag_top.addWidget(btn_preset_win5)
-        frag_vbox.addLayout(frag_top)
-
-        frag_grid = QGridLayout()
-        frag_grid.setHorizontalSpacing(12)
-        frag_grid.setVerticalSpacing(6)
+        mux_hdr_w = QWidget()
+        mh_row = QHBoxLayout(mux_hdr_w)
+        mh_row.setContentsMargins(0, 0, 0, 0)
+        self.sw_mux = AnimatedToggleSwitch(checked=False)
+        self.sw_mux.toggled.connect(lambda c: self._on_single_switch("mux_enabled", c))
+        self._switches.append(self.sw_mux)
+        self.lbl_sw_mux = QLabel(I18N.t("sw_mux"))
+        self.lbl_sw_mux.setObjectName("SecondaryLabel")
+        self.mux_conc_spin = QSpinBox()
+        self.mux_conc_spin.setRange(1, 64)
+        self.mux_conc_spin.setValue(8)
+        enforce_english_ltr(self.mux_conc_spin, mono_size=10)
+        mh_row.addWidget(self.sw_mux)
+        mh_row.addWidget(self.lbl_sw_mux, 1)
+        mh_row.addWidget(self.mux_conc_spin)
 
         self.frag_packets_combo = QComboBox()
-        for pkt in ("tlshello", "1-3", "1-5"):
-            self.frag_packets_combo.addItem(pkt, pkt)
+        for pk in ("tlshello", "1-3", "1-5"):
+            self.frag_packets_combo.addItem(pk, pk)
         enforce_english_ltr(self.frag_packets_combo, mono_size=10)
 
-        self.frag_length_edit = QLineEdit("5-16")
-        enforce_english_ltr(self.frag_length_edit, mono_size=10)
+        self.frag_len_edit = QLineEdit("5-16")
+        enforce_english_ltr(self.frag_len_edit, mono_size=10)
 
-        self.frag_interval_edit = QLineEdit("2-3")
-        enforce_english_ltr(self.frag_interval_edit, mono_size=10)
+        self.frag_int_edit = QLineEdit("2-3")
+        enforce_english_ltr(self.frag_int_edit, mono_size=10)
 
-        frag_grid.addWidget(self._sec_lbl("بسته‌های هدف (Packets):"), 0, 0)
-        frag_grid.addWidget(self._sec_lbl("طول تکه بایت (Length):"), 0, 1)
-        frag_grid.addWidget(self._sec_lbl("وقفه ارسال (Interval ms):"), 0, 2)
-        frag_grid.addWidget(self.frag_packets_combo, 1, 0)
-        frag_grid.addWidget(self.frag_length_edit, 1, 1)
-        frag_grid.addWidget(self.frag_interval_edit, 1, 2)
-        frag_vbox.addLayout(frag_grid)
-        adv.addWidget(frag_box)
-
-        net_grid = QGridLayout()
-        net_grid.setHorizontalSpacing(14)
-        net_grid.setVerticalSpacing(8)
-
-        self.fingerprint_combo = QComboBox()
-        for fp in ("chrome", "safari", "firefox", "ios"):
-            self.fingerprint_combo.addItem(fp, fp)
-        enforce_english_ltr(self.fingerprint_combo, mono_size=10)
+        self.fp_combo = QComboBox()
+        enforce_english_ltr(self.fp_combo, mono_size=10)
+        self.set_fingerprints([])
 
         self.alpn_combo = QComboBox()
-        for alpn in ("auto", "http/1.1", "h2,http/1.1"):
+        for alpn in ("auto", "h2,http/1.1", "http/1.1", "h2"):
             self.alpn_combo.addItem(alpn, alpn)
         enforce_english_ltr(self.alpn_combo, mono_size=10)
 
-        self.early_data_combo = QComboBox()
+        self.ed_combo = QComboBox()
         for ed in (0, 2048, 2560):
-            self.early_data_combo.addItem(f"{ed} Bytes" if (ed > 0) else "0 (Disabled)", ed)
-        enforce_english_ltr(self.early_data_combo, mono_size=10)
-        self.early_data_combo.setCurrentIndex(1)
-
-        mux_wrap = QWidget()
-        mux_row = QHBoxLayout(mux_wrap)
-        mux_row.setContentsMargins(0, 0, 0, 0)
-        mux_row.setSpacing(10)
-        self.sw_mux_enabled = AnimatedToggleSwitch(checked=False)
-        self.sw_mux_enabled.toggled.connect(self._emit_changes)
-        self._switches.append(self.sw_mux_enabled)
-        self.mux_concurrency_spin = QSpinBox()
-        self.mux_concurrency_spin.setRange(1, 64)
-        self.mux_concurrency_spin.setValue(8)
-        self.mux_concurrency_spin.setPrefix("Concurrency: ")
-        enforce_english_ltr(self.mux_concurrency_spin, mono_size=10)
-        mux_row.addWidget(self.sw_mux_enabled)
-        mux_row.addWidget(self.mux_concurrency_spin, 1)
-
-        self.manual_vector_combo = QComboBox()
-        enforce_english_ltr(self.manual_vector_combo, mono_size=10)
-        self.set_vectors([])
+            self.ed_combo.addItem(f"{ed} B" if ed > 0 else "0 (Off)", ed)
+        self.ed_combo.setCurrentIndex(1)
+        enforce_english_ltr(self.ed_combo, mono_size=10)
 
         self.stride_spin = QSpinBox()
         self.stride_spin.setRange(0, 8192)
         self.stride_spin.setSingleStep(50)
         self.stride_spin.setValue(400)
-        self.stride_spin.setSuffix(" B")
         enforce_english_ltr(self.stride_spin, mono_size=10)
 
         self.jitter_spin = QSpinBox()
         self.jitter_spin.setRange(0, 2048)
-        self.jitter_spin.setSingleStep(8)
         self.jitter_spin.setValue(32)
-        self.jitter_spin.setSuffix(" B")
         enforce_english_ltr(self.jitter_spin, mono_size=10)
 
-        self.socks_port_spin = QSpinBox()
-        self.socks_port_spin.setRange(1024, 65535)
-        self.socks_port_spin.setValue(10808)
-        enforce_english_ltr(self.socks_port_spin, mono_size=10)
+        self.mtu_spin = QSpinBox()
+        self.mtu_spin.setRange(1280, 9000)
+        self.mtu_spin.setValue(1500)
+        enforce_english_ltr(self.mtu_spin, mono_size=10)
 
-        self.http_port_spin = QSpinBox()
-        self.http_port_spin.setRange(1024, 65535)
-        self.http_port_spin.setValue(10809)
-        enforce_english_ltr(self.http_port_spin, mono_size=10)
+        self.socks_spin = QSpinBox()
+        self.socks_spin.setRange(1024, 65535)
+        self.socks_spin.setValue(10808)
+        enforce_english_ltr(self.socks_spin, mono_size=10)
 
-        pairs = [
-            ("اثرانگشت TLS (Fingerprint):", self.fingerprint_combo, 0, 0),
-            ("تنظیم ALPN Override:", self.alpn_combo, 0, 1),
-            ("حجم WebSocket EarlyData:", self.early_data_combo, 1, 0),
-            ("مالتی‌پلکسینگ (Mux & Concurrency):", mux_wrap, 1, 1),
-            ("انتخاب دستی بردار عبوری:", self.manual_vector_combo, 2, 0),
-            ("گام پیشروی بایت (Forward Stride):", self.stride_spin, 2, 1),
-            ("دامنه تغییرات گام (Stride Jitter):", self.jitter_spin, 3, 0),
-            ("پورت محلی SOCKS5:", self.socks_port_spin, 3, 1),
-            ("پورت محلی HTTP Proxy:", self.http_port_spin, 4, 0),
+        self.http_spin = QSpinBox()
+        self.http_spin.setRange(1024, 65535)
+        self.http_spin.setValue(10809)
+        enforce_english_ltr(self.http_spin, mono_size=10)
+
+        self.bridge_spin = QSpinBox()
+        self.bridge_spin.setRange(1024, 65535)
+        self.bridge_spin.setValue(10810)
+        enforce_english_ltr(self.bridge_spin, mono_size=10)
+
+        grid.addWidget(frag_hdr_w, 0, 0)
+        grid.addWidget(mux_hdr_w, 0, 1)
+
+        self._core_field_labels: list[tuple[QLabel, str]] = []
+        core_fields = [
+            ("engine_mode_lbl", self.engine_mode_combo, 1, 0),
+            ("manual_vec_lbl", self.manual_vec_combo, 1, 1),
+            ("frag_packets_lbl", self.frag_packets_combo, 2, 0),
+            ("frag_length_lbl", self.frag_len_edit, 2, 1),
+            ("frag_interval_lbl", self.frag_int_edit, 3, 0),
+            ("tls_fp_lbl", self.fp_combo, 3, 1),
+            ("alpn_lbl", self.alpn_combo, 4, 0),
+            ("early_data_lbl", self.ed_combo, 4, 1),
+            ("stride_lbl", self.stride_spin, 5, 0),
+            ("jitter_lbl", self.jitter_spin, 5, 1),
+            ("tun_mtu_lbl", self.mtu_spin, 6, 0),
+            ("socks_port_lbl", self.socks_spin, 6, 1),
+            ("http_port_lbl", self.http_spin, 7, 0),
+            ("bridge_port_lbl", self.bridge_spin, 7, 1),
         ]
+        for key_str, widget, r, c in core_fields:
+            lbl = QLabel(I18N.t(key_str))
+            lbl.setObjectName("SecondaryLabel")
+            self._core_field_labels.append((lbl, key_str))
+            grid.addWidget(lbl, r * 2 - 1, c)
+            grid.addWidget(widget, r * 2, c)
 
-        for title_txt, widget, r, c in pairs:
-            net_grid.addWidget(self._sec_lbl(title_txt), r * 2, c)
-            net_grid.addWidget(widget, r * 2 + 1, c)
-
-        adv.addLayout(net_grid)
-        body_layout.addWidget(self.adv_accordion)
-        body_layout.addStretch()
-
-        self.scroll = make_transparent_scroll_area(body)
-        outer.addWidget(self.scroll, 1)
-
-        for combo in (
+        for cb in (
             self.engine_mode_combo,
+            self.manual_vec_combo,
             self.frag_packets_combo,
-            self.fingerprint_combo,
+            self.fp_combo,
             self.alpn_combo,
-            self.early_data_combo,
-            self.manual_vector_combo,
+            self.ed_combo,
         ):
-            combo.currentIndexChanged.connect(self._emit_changes)
+            cb.currentIndexChanged.connect(self._emit_all)
 
-        for edit in (self.frag_length_edit, self.frag_interval_edit):
-            edit.editingFinished.connect(self._emit_changes)
+        for ed_w in (self.frag_len_edit, self.frag_int_edit):
+            ed_w.editingFinished.connect(self._emit_all)
 
-        for sp in (
-            self.mux_concurrency_spin,
+        for sp_w in (
+            self.mux_conc_spin,
             self.stride_spin,
             self.jitter_spin,
-            self.socks_port_spin,
-            self.http_port_spin,
+            self.mtu_spin,
+            self.socks_spin,
+            self.http_spin,
+            self.bridge_spin,
         ):
-            sp.valueChanged.connect(self._emit_changes)
+            sp_w.valueChanged.connect(self._emit_all)
 
-    def bind_controller(self, controller) -> None:
-        self._controller = controller
-        if controller is not None:
-            getter = getattr(controller, "get_settings", None)
-            if callable(getter):
-                raw_settings = getter()
-                if isinstance(raw_settings, dict):
-                    self.apply_settings_dict(raw_settings)
+        vbox.addWidget(card)
+        vbox.addStretch()
+        self._populate_core_combos()
+        return make_transparent_scroll_area(host)
 
-    def _sec_lbl(self, text: str) -> QLabel:
-        lbl = QLabel(text)
-        lbl.setObjectName("SecondaryLabel")
-        return lbl
+    def _schedule_domain_emit(self) -> None:
+        if not self._updating:
+            self._domain_debounce.start()
 
-    def _add_base_switch_row(
+    def _on_sub_hours_combo_changed(self, idx: int) -> None:
+        if self._updating or idx < 0:
+            return
+        hrs = int(self.sub_hours_combo.itemData(idx) or 0)
+        self.setting_key_changed.emit("sub_auto_update_hours", hrs)
+        self._emit_all()
+
+    def _populate_routing_combos(self) -> None:
+        prev = str(self.routing_mode_combo.currentData() or "bypass_ir")
+        if prev == "bypass_iran_lan":
+            prev = "bypass_ir"
+        with QSignalBlocker(self.routing_mode_combo):
+            self.routing_mode_combo.clear()
+            self.routing_mode_combo.addItem(I18N.t("rmode_bypass_ir"), "bypass_ir")
+            self.routing_mode_combo.addItem(I18N.t("rmode_global"), "global")
+            self.routing_mode_combo.addItem(I18N.t("rmode_custom"), "custom")
+            i = self.routing_mode_combo.findData(prev)
+            if i >= 0:
+                self.routing_mode_combo.setCurrentIndex(i)
+
+    def _populate_behavior_combos(self) -> None:
+        prev = self.sub_hours_combo.currentData()
+        hrs_val = int(prev) if prev is not None else 6
+        with QSignalBlocker(self.sub_hours_combo):
+            self.sub_hours_combo.clear()
+            for h in SUB_UPDATE_INTERVAL_HOURS:
+                lbl = I18N.t("sub_off") if h == 0 else I18N.t("sub_every_h", h=h)
+                self.sub_hours_combo.addItem(lbl, h)
+            i = self.sub_hours_combo.findData(hrs_val)
+            if i >= 0:
+                self.sub_hours_combo.setCurrentIndex(i)
+
+    def _populate_core_combos(self) -> None:
+        prev = self.engine_mode_combo.currentData() or "auto_hybrid"
+        with QSignalBlocker(self.engine_mode_combo):
+            self.engine_mode_combo.clear()
+            self.engine_mode_combo.addItem(I18N.t("emode_hybrid"), "auto_hybrid")
+            self.engine_mode_combo.addItem(I18N.t("emode_prop"), "proprietary_only")
+            self.engine_mode_combo.addItem(I18N.t("emode_frag"), "fragment_only")
+            i = self.engine_mode_combo.findData(prev)
+            if i >= 0:
+                self.engine_mode_combo.setCurrentIndex(i)
+
+    def _add_switch_item(
         self,
-        parent_layout: QVBoxLayout,
+        layout: QVBoxLayout,
         setting_key: str,
-        title: str,
-        desc: str,
-        default: bool,
+        title_i18n: str,
+        desc_i18n: str,
+        default_val: bool,
     ) -> AnimatedToggleSwitch:
         row = QHBoxLayout()
         row.setSpacing(12)
-        txt_col = QVBoxLayout()
-        txt_col.setSpacing(2)
-        t = QLabel(title)
-        t.setFont(make_ui_font(10, QFont.Weight.Bold))
-        d = QLabel(desc)
-        d.setObjectName("MutedLabel")
-        txt_col.addWidget(t)
-        txt_col.addWidget(d)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        t_lbl = QLabel(I18N.t(title_i18n))
+        t_lbl.setFont(make_ui_font(10, QFont.Weight.Bold))
+        d_lbl = QLabel(I18N.t(desc_i18n))
+        d_lbl.setObjectName("MutedLabel")
+        d_lbl.setWordWrap(True)
+        col.addWidget(t_lbl)
+        col.addWidget(d_lbl)
 
-        sw = AnimatedToggleSwitch(checked=bool(default))
-        sw.toggled.connect(lambda checked, k=setting_key: self._on_base_switch_toggled(k, checked))
+        sw = AnimatedToggleSwitch(checked=default_val)
+        sw.toggled.connect(lambda c, k=setting_key: self._on_single_switch(k, c))
         self._switches.append(sw)
+        self._switch_labels.append((t_lbl, title_i18n, d_lbl, desc_i18n))
 
-        row.addLayout(txt_col, 1)
+        row.addLayout(col, 1)
         row.addWidget(sw)
-        parent_layout.addLayout(row)
+        layout.addLayout(row)
         return sw
 
-    def _on_base_switch_toggled(self, key: str, checked: bool):
+    def _on_single_switch(self, key: str, checked: bool) -> None:
         if self._updating:
             return
-        state = bool(checked)
-        if self._controller is not None:
-            slot_name = self.BASE_SWITCH_SLOTS.get(key, f"set_{key}")
-            setter = getattr(self._controller, slot_name, None)
-            if callable(setter):
-                setter(state)
-            else:
-                updater = getattr(self._controller, "update_settings", None)
-                if callable(updater):
-                    updater({key: state})
-        self.base_switch_toggled.emit(key, state)
+        self.setting_key_changed.emit(key, bool(checked))
+        self.settings_changed.emit(self.collect_settings())
 
-    def _apply_fragment_preset(self, packets: str, length: str, interval: str):
+    def set_vectors(self, vectors: list) -> None:
+        prev = str(self.manual_vec_combo.currentData() or "AUTO")
         self._updating = True
-        self.sw_fragment_enabled.set_CheckedSilent(True)
-        idx = self.frag_packets_combo.findData(packets)
-        if idx >= 0:
-            self.frag_packets_combo.setCurrentIndex(idx)
-        self.frag_length_edit.setText(length)
-        self.frag_interval_edit.setText(interval)
-        self._updating = False
-        self._emit_changes()
-
-    def set_vectors(self, vectors: list):
-        prev_val = self.manual_vector_combo.currentData()
-        self._updating = True
-        self.manual_vector_combo.clear()
-        if not vectors:
-            for i in range(1, 17):
-                vid = f"VEC-{i:02d}"
-                self.manual_vector_combo.addItem(vid, vid)
-        else:
-            for v in vectors:
-                if isinstance(v, dict):
-                    vid = pick_first_text(v, ("id", "vector_id", "code"), "VEC-01")
-                    vname = sanitize_ui_text(pick_first_text(v, ("name", "title"), ""))
-                    label = f"{vid} | {vname}" if (vname and (vname != vid)) else vid
-                elif isinstance(v, str):
-                    vid = v
-                    label = sanitize_ui_text(v)
-                else:
-                    vid = str(getattr(v, "id", getattr(v, "vector_id", str(v))))
-                    vname = sanitize_ui_text(str(getattr(v, "name", "")))
-                    label = f"{vid} | {vname}" if vname else vid
-                self.manual_vector_combo.addItem(label, vid)
-        if prev_val is not None:
-            idx = self.manual_vector_combo.findData(prev_val)
-            if idx >= 0:
-                self.manual_vector_combo.setCurrentIndex(idx)
+        with QSignalBlocker(self.manual_vec_combo):
+            self.manual_vec_combo.clear()
+            self.manual_vec_combo.addItem("AUTO", "AUTO")
+            for vid, vlabel in normalize_vector_entries(vectors):
+                self.manual_vec_combo.addItem(vlabel, vid)
+            i = self.manual_vec_combo.findData(prev)
+            self.manual_vec_combo.setCurrentIndex(i if i >= 0 else 0)
         self._updating = False
 
-    def set_autopilot_mode(self, autopilot_enabled: bool):
-        self.manual_vector_combo.setEnabled(not bool(autopilot_enabled))
+    def set_fingerprints(self, fingerprints: list) -> None:
+        prev = str(self.fp_combo.currentData() or "custom_poly")
+        self._updating = True
+        with QSignalBlocker(self.fp_combo):
+            self.fp_combo.clear()
+            for fp_val, fp_lbl in normalize_fingerprint_entries(fingerprints):
+                self.fp_combo.addItem(fp_lbl, fp_val)
+            i = self.fp_combo.findData(prev)
+            self.fp_combo.setCurrentIndex(i if i >= 0 else 0)
+        self._updating = False
 
-    def apply_settings_dict(self, s: dict):
+    def set_sub_auto_update_hours_silent(self, hours: int) -> None:
+        self._updating = True
+        try:
+            with QSignalBlocker(self.sub_hours_combo):
+                idx = self.sub_hours_combo.findData(int(hours or 0))
+                if idx >= 0:
+                    self.sub_hours_combo.setCurrentIndex(idx)
+        finally:
+            self._updating = False
+
+    def apply_settings(self, s: dict) -> None:
         if not isinstance(s, dict):
             return
         self._updating = True
         try:
-            self.sw_auto_clean_ip.set_CheckedSilent(
-                get_bool_value(s, "auto_clean_ip", self.sw_auto_clean_ip.isChecked())
-            )
-            self.sw_youtube_6s.set_CheckedSilent(
-                get_bool_value(s, "require_youtube_6s", self.sw_youtube_6s.isChecked())
-            )
-            self.sw_upload_stream.set_CheckedSilent(
-                get_bool_value(s, "verify_upload_stream", self.sw_upload_stream.isChecked())
-            )
-            self.sw_watchdog.set_CheckedSilent(
-                get_bool_value(s, "self_healing_watchdog", self.sw_watchdog.isChecked())
-            )
-            self.sw_fragment_enabled.set_CheckedSilent(
-                get_bool_value(s, "fragment_enabled", self.sw_fragment_enabled.isChecked())
-            )
-            self.sw_mux_enabled.set_CheckedSilent(
-                get_bool_value(s, "mux_enabled", self.sw_mux_enabled.isChecked())
-            )
+            for sw, key in (
+                (self.sw_block_quic, "block_quic"),
+                (self.sw_min_tray, "minimize_to_tray"),
+                (self.sw_pool_fallback, "auto_pool_fallback"),
+                (self.sw_yt_guard, "require_youtube_6s"),
+                (self.sw_upload_burst, "verify_upload_stream"),
+                (self.sw_watchdog, "self_healing_watchdog"),
+                (self.sw_frag, "fragment_enabled"),
+                (self.sw_mux, "mux_enabled"),
+            ):
+                if key in s:
+                    set_switch_blocked(sw, get_bool(s, key, sw.isChecked()))
 
-            self._select_combo_data(self.engine_mode_combo, s.get("engine_mode", None))
-            self._select_combo_data(self.frag_packets_combo, s.get("fragment_packets", None))
-            self._select_combo_data(self.fingerprint_combo, s.get("fingerprint", None))
-            self._select_combo_data(self.alpn_combo, s.get("alpn_override", None))
-            if ("ws_early_data" in s) and (s["ws_early_data"] is not None):
-                self._select_combo_data(
-                    self.early_data_combo,
-                    parse_int_value(s.get("ws_early_data", 2048), 2048),
-                )
-            self._select_combo_data(self.manual_vector_combo, s.get("manual_vector_id", None))
+            if "routing_mode" in s and s["routing_mode"] is not None:
+                rm_val = str(s["routing_mode"]).strip()
+                if rm_val == "bypass_iran_lan":
+                    rm_val = "bypass_ir"
+                idx_rm = self.routing_mode_combo.findData(rm_val)
+                if idx_rm >= 0:
+                    self.routing_mode_combo.setCurrentIndex(idx_rm)
 
-            if ("fragment_length" in s) and (s["fragment_length"] is not None):
-                self.frag_length_edit.setText(str(s["fragment_length"]))
-            if ("fragment_interval" in s) and (s["fragment_interval"] is not None):
-                self.frag_interval_edit.setText(str(s["fragment_interval"]))
-            if ("mux_concurrency" in s) and (s["mux_concurrency"] is not None):
-                self.mux_concurrency_spin.setValue(parse_int_value(s.get("mux_concurrency", 8), 8))
-            if ("forward_stride_bytes" in s) and (s["forward_stride_bytes"] is not None):
-                self.stride_spin.setValue(parse_int_value(s.get("forward_stride_bytes", 400), 400))
-            if ("stride_jitter_bytes" in s) and (s["stride_jitter_bytes"] is not None):
-                self.jitter_spin.setValue(parse_int_value(s.get("stride_jitter_bytes", 32), 32))
-            if ("socks_port" in s) and (s["socks_port"] is not None):
-                self.socks_port_spin.setValue(parse_int_value(s.get("socks_port", 10808), 10808))
-            if ("http_port" in s) and (s["http_port"] is not None):
-                self.http_port_spin.setValue(parse_int_value(s.get("http_port", 10809), 10809))
+            for combo, key in (
+                (self.sub_hours_combo, "sub_auto_update_hours"),
+                (self.engine_mode_combo, "engine_mode"),
+                (self.manual_vec_combo, "manual_vector_id"),
+                (self.frag_packets_combo, "fragment_packets"),
+                (self.fp_combo, "fingerprint"),
+                (self.alpn_combo, "alpn_override"),
+                (self.ed_combo, "ws_early_data"),
+            ):
+                if key in s and s[key] is not None:
+                    val = s[key]
+                    if key in ("fingerprint", "manual_vector_id") and combo.findData(val) < 0:
+                        combo.addItem(str(val), str(val))
+                    idx = combo.findData(val)
+                    if idx >= 0:
+                        combo.setCurrentIndex(idx)
 
-            if "autopilot" in s:
-                self.set_autopilot_mode(get_bool_value(s, "autopilot", True))
+            for edit, key in (
+                (self.remote_dns_edit, "remote_dns"),
+                (self.domestic_dns_edit, "domestic_dns"),
+                (self.frag_len_edit, "fragment_length"),
+                (self.frag_int_edit, "fragment_interval"),
+            ):
+                if key in s and s[key] is not None:
+                    edit.setText(str(s[key]))
+
+            for area, primary_key, legacy_key in (
+                (self.direct_domains_edit, "custom_direct_domains", "direct_domains"),
+                (self.proxy_domains_edit, "custom_proxy_domains", "proxy_domains"),
+                (self.blocked_domains_edit, "custom_blocked_domains", "blocked_domains"),
+            ):
+                raw_dom = s.get(primary_key, s.get(legacy_key))
+                if raw_dom is not None:
+                    if isinstance(raw_dom, list):
+                        self._domains_as_list = True
+                        txt = "\n".join(str(x) for x in raw_dom if str(x).strip())
+                    else:
+                        txt = str(raw_dom)
+                    area.setPlainText(txt)
+
+            for spin, key in (
+                (self.mux_conc_spin, "mux_concurrency"),
+                (self.stride_spin, "forward_stride_bytes"),
+                (self.jitter_spin, "stride_jitter_bytes"),
+                (self.mtu_spin, "tun_mtu"),
+                (self.socks_spin, "socks_port"),
+                (self.http_spin, "http_port"),
+                (self.bridge_spin, "bridge_port"),
+            ):
+                if key in s and s[key] is not None:
+                    spin.setValue(get_int(s, key, spin.value()))
         finally:
             self._updating = False
 
-    def _select_combo_data(self, combo: QComboBox, value):
-        if value is None:
-            return
-        idx = combo.findData(value)
-        if idx < 0:
-            idx = combo.findText(str(value))
-        if idx >= 0:
-            combo.setCurrentIndex(idx)
+    def _serialize_domain_field(self, area: QPlainTextEdit):
+        raw = area.toPlainText().strip()
+        if self._domains_as_list:
+            return [ln.strip() for ln in raw.replace(",", "\n").splitlines() if ln.strip()]
+        return raw
 
     def collect_settings(self) -> dict:
-        frag_len = self.frag_length_edit.text().strip()
-        if not frag_len:
-            frag_len = "5-16"
-        frag_int = self.frag_interval_edit.text().strip()
-        if not frag_int:
-            frag_int = "2-3"
-        early_data_raw = self.early_data_combo.currentData()
-        vec_raw = self.manual_vector_combo.currentData()
-        vec_id = str(vec_raw) if (vec_raw is not None and str(vec_raw).strip()) else "VEC-01"
-
         return {
-            "auto_clean_ip": bool(self.sw_auto_clean_ip.isChecked()),
-            "require_youtube_6s": bool(self.sw_youtube_6s.isChecked()),
-            "verify_upload_stream": bool(self.sw_upload_stream.isChecked()),
+            "routing_mode": str(self.routing_mode_combo.currentData() or "bypass_ir"),
+            "block_quic": bool(self.sw_block_quic.isChecked()),
+            "remote_dns": self.remote_dns_edit.text().strip() or "https://1.1.1.1/dns-query",
+            "domestic_dns": self.domestic_dns_edit.text().strip() or "178.22.122.100",
+            "custom_direct_domains": self._serialize_domain_field(self.direct_domains_edit),
+            "custom_proxy_domains": self._serialize_domain_field(self.proxy_domains_edit),
+            "custom_blocked_domains": self._serialize_domain_field(self.blocked_domains_edit),
+            "minimize_to_tray": bool(self.sw_min_tray.isChecked()),
+            "auto_pool_fallback": bool(self.sw_pool_fallback.isChecked()),
+            "require_youtube_6s": bool(self.sw_yt_guard.isChecked()),
+            "verify_upload_stream": bool(self.sw_upload_burst.isChecked()),
             "self_healing_watchdog": bool(self.sw_watchdog.isChecked()),
-            "engine_mode": self.engine_mode_combo.currentData(),
-            "fragment_enabled": bool(self.sw_fragment_enabled.isChecked()),
-            "fragment_packets": self.frag_packets_combo.currentData(),
-            "fragment_length": frag_len,
-            "fragment_interval": frag_int,
-            "fingerprint": self.fingerprint_combo.currentData(),
-            "alpn_override": self.alpn_combo.currentData(),
-            "ws_early_data": parse_int_value(early_data_raw, 0),
-            "mux_enabled": bool(self.sw_mux_enabled.isChecked()),
-            "mux_concurrency": int(self.mux_concurrency_spin.value()),
-            "manual_vector_id": vec_id,
+            "sub_auto_update_hours": int(self.sub_hours_combo.currentData() or 0),
+            "engine_mode": str(self.engine_mode_combo.currentData() or "auto_hybrid"),
+            "manual_vector_id": str(self.manual_vec_combo.currentData() or "AUTO"),
+            "fragment_enabled": bool(self.sw_frag.isChecked()),
+            "fragment_packets": str(self.frag_packets_combo.currentData() or "tlshello"),
+            "fragment_length": self.frag_len_edit.text().strip() or "5-16",
+            "fragment_interval": self.frag_int_edit.text().strip() or "2-3",
+            "fingerprint": str(self.fp_combo.currentData() or "custom_poly"),
+            "alpn_override": str(self.alpn_combo.currentData() or "auto"),
+            "ws_early_data": int(self.ed_combo.currentData() or 0),
+            "mux_enabled": bool(self.sw_mux.isChecked()),
+            "mux_concurrency": int(self.mux_conc_spin.value()),
             "forward_stride_bytes": int(self.stride_spin.value()),
             "stride_jitter_bytes": int(self.jitter_spin.value()),
-            "socks_port": int(self.socks_port_spin.value()),
-            "http_port": int(self.http_port_spin.value()),
+            "tun_mtu": int(self.mtu_spin.value()),
+            "socks_port": int(self.socks_spin.value()),
+            "http_port": int(self.http_spin.value()),
+            "bridge_port": int(self.bridge_spin.value()),
         }
 
-    def _emit_changes(self, *_args):
+    def _emit_all(self, *_args) -> None:
         if not self._updating:
-            self.settings_updated.emit(self.collect_settings())
+            self.settings_changed.emit(self.collect_settings())
 
-    def set_palette_theme(self, palette: ThemePalette):
+    def retranslate_ui(self) -> None:
+        self.title_lbl.setText(I18N.t("settings_title"))
+        self.sub_lbl.setText(I18N.t("settings_subtitle"))
+        self.sub_tabs.update_labels([I18N.t("stab_routing"), I18N.t("stab_behavior"), I18N.t("stab_core")])
+        self.lbl_rmode.setText(I18N.t("routing_mode_lbl"))
+        self.lbl_remote_dns.setText(I18N.t("remote_dns_lbl"))
+        self.lbl_dom_dns.setText(I18N.t("domestic_dns_lbl"))
+        self.lbl_direct_dom.setText(I18N.t("direct_domains_lbl"))
+        self.lbl_proxy_dom.setText(I18N.t("proxy_domains_lbl"))
+        self.lbl_block_dom.setText(I18N.t("blocked_domains_lbl"))
+        self.lbl_sub_hrs.setText(I18N.t("sub_autoupdate_lbl"))
+        self.lbl_sw_frag.setText(I18N.t("sw_native_frag"))
+        self.lbl_sw_mux.setText(I18N.t("sw_mux"))
+        for t_l, t_k, d_l, d_k in self._switch_labels:
+            t_l.setText(I18N.t(t_k))
+            if d_l and d_k:
+                d_l.setText(I18N.t(d_k))
+        for lbl, k_str in self._core_field_labels:
+            lbl.setText(I18N.t(k_str))
+        self._populate_routing_combos()
+        self._populate_behavior_combos()
+        self._populate_core_combos()
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
-        self.adv_accordion.set_palette_theme(palette)
+        self.sub_tabs.set_palette_theme(palette)
+        for card in self._neu_cards:
+            card.set_palette_theme(palette)
         for sw in self._switches:
             sw.set_palette_theme(palette)
 
@@ -2902,41 +3006,48 @@ class LogsPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._all_lines: list[str] = []
-        self._query = ""
+        self._warn_only = False
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 12, 20, 16)
-        root.setSpacing(12)
+        root.setContentsMargins(20, 12, 20, 14)
+        root.setSpacing(10)
 
-        top_bar = QHBoxLayout()
-        title = QLabel("گزارش زنده موتور Alan-RIP-Dpi")
-        title.setFont(make_ui_font(15, QFont.Weight.ExtraBold))
+        self.top_card = NeuCard(mode="raised", radius=16.0, depth=4.5, pad=5.0)
+        top = QHBoxLayout(self.top_card)
+        top.setContentsMargins(16, 11, 16, 11)
+        top.setSpacing(8)
+        self.title_lbl = QLabel(I18N.t("logs_title"))
+        self.title_lbl.setObjectName("PageTitle")
 
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("فیلتر و جستجو در لاگ...")
-        self.search_edit.setMaximumWidth(260)
+        self.search_edit.setPlaceholderText(I18N.t("logs_search_ph"))
+        self.search_edit.setMaximumWidth(280)
         enforce_english_ltr(self.search_edit, mono_size=10)
-        self.search_edit.textChanged.connect(self._on_filter_changed)
+        self.search_edit.textChanged.connect(lambda _t: self._refresh_view())
 
-        self.copy_btn = QPushButton("کپی همه")
-        self.copy_btn.setObjectName("GhostPillBtn")
-        self.copy_btn.clicked.connect(self._copy_logs)
+        self.filter_seg = SegmentedControl([I18N.t("logs_all"), I18N.t("logs_warn")])
+        self.filter_seg.current_changed.connect(self._on_filter_mode)
 
-        self.clear_btn = QPushButton("پاکسازی")
-        self.clear_btn.setObjectName("GhostPillBtn")
-        self.clear_btn.clicked.connect(self._clear_logs)
+        self.copy_btn = QPushButton(I18N.t("logs_copy"))
+        self.copy_btn.setObjectName("GhostBtn")
+        self.copy_btn.clicked.connect(lambda: QGuiApplication.clipboard().setText(self.console.toPlainText()))
 
-        self.save_btn = QPushButton("ذخیره در فایل")
+        self.clear_btn = QPushButton(I18N.t("logs_clear"))
+        self.clear_btn.setObjectName("DangerBtn")
+        self.clear_btn.clicked.connect(self._clear)
+
+        self.save_btn = QPushButton(I18N.t("logs_save"))
         self.save_btn.setObjectName("AccentBtn")
-        self.save_btn.clicked.connect(self._save_logs)
+        self.save_btn.clicked.connect(self._export)
 
-        top_bar.addWidget(title)
-        top_bar.addStretch()
-        top_bar.addWidget(self.search_edit)
-        top_bar.addWidget(self.copy_btn)
-        top_bar.addWidget(self.clear_btn)
-        top_bar.addWidget(self.save_btn)
-        root.addLayout(top_bar)
+        top.addWidget(self.title_lbl)
+        top.addStretch()
+        top.addWidget(self.search_edit)
+        top.addWidget(self.filter_seg)
+        top.addWidget(self.copy_btn)
+        top.addWidget(self.clear_btn)
+        top.addWidget(self.save_btn)
+        root.addWidget(self.top_card)
 
         self.console = QPlainTextEdit()
         self.console.setObjectName("LogConsole")
@@ -2944,44 +3055,54 @@ class LogsPage(QWidget):
         enforce_english_ltr(self.console, mono_size=10)
         root.addWidget(self.console, 1)
 
-    def append_line(self, line: str):
-        clean_line = sanitize_ui_text(line)
-        self._all_lines.append(clean_line)
+    def _on_filter_mode(self, idx: int) -> None:
+        self._warn_only = (idx == 1)
+        self._refresh_view()
+
+    def _matches(self, line: str) -> bool:
+        low = line.lower()
+        if self._warn_only and not any(w in low for w in ("warn", "err", "fail", "timeout", "drop", "block")):
+            return False
+        q = self.search_edit.text().strip().lower()
+        return (not q) or (q in low)
+
+    def append_line(self, line: str) -> None:
+        clean = strip_emojis(line)
+        self._all_lines.append(clean)
         if len(self._all_lines) > 5000:
             self._all_lines = self._all_lines[-5000:]
-
-        if (not self._query) or (self._query in clean_line.lower()):
-            self.console.appendPlainText(clean_line)
+        if self._matches(clean):
+            self.console.appendPlainText(clean)
             sb = self.console.verticalScrollBar()
             sb.setValue(sb.maximum())
 
-    def _on_filter_changed(self, text: str):
-        self._query = text.strip().lower()
+    def _refresh_view(self) -> None:
         self.console.setUpdatesEnabled(False)
         try:
-            if not self._query:
-                self.console.setPlainText("\n".join(self._all_lines))
-            else:
-                filtered = [ln for ln in self._all_lines if self._query in ln.lower()]
-                self.console.setPlainText("\n".join(filtered))
+            filtered = [ln for ln in self._all_lines if self._matches(ln)]
+            self.console.setPlainText("\n".join(filtered))
             sb = self.console.verticalScrollBar()
             sb.setValue(sb.maximum())
         finally:
             self.console.setUpdatesEnabled(True)
 
-    def _copy_logs(self):
-        QGuiApplication.clipboard().setText(self.console.toPlainText())
-
-    def _clear_logs(self):
+    def _clear(self) -> None:
         self._all_lines.clear()
         self.console.clear()
 
-    def _save_logs(self):
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "ذخیره گزارش Alan-RIP-Dpi",
-            "alan-rip-dpi.log",
-            "Log Files (*.log *.txt)",
-        )
-        if file_path:
-            Path(file_path).write_text(self.console.toPlainText(), encoding="utf-8")
+    def _export(self) -> None:
+        fpath, _ = QFileDialog.getSaveFileName(self, "Export Logs", "alan-rip-dpi.log", "Log Files (*.log *.txt)")
+        if fpath:
+            Path(fpath).write_text(self.console.toPlainText(), encoding="utf-8")
+
+    def retranslate_ui(self) -> None:
+        self.title_lbl.setText(I18N.t("logs_title"))
+        self.search_edit.setPlaceholderText(I18N.t("logs_search_ph"))
+        self.filter_seg.update_labels([I18N.t("logs_all"), I18N.t("logs_warn")])
+        self.copy_btn.setText(I18N.t("logs_copy"))
+        self.clear_btn.setText(I18N.t("logs_clear"))
+        self.save_btn.setText(I18N.t("logs_save"))
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
+        self.top_card.set_palette_theme(palette)
+        self.filter_seg.set_palette_theme(palette)

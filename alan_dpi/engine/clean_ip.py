@@ -2,10 +2,12 @@ import concurrent.futures
 import ipaddress
 import random
 import socket
-import struct
+import ssl
 import time
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
+import requests
 from alan_dpi.engine.models import ProfileNode
+from alan_dpi.engine.mutator import TlsByteMutator
 
 
 CLOUDFLARE_SUPERNETS = [
@@ -29,30 +31,43 @@ POISONED_DNS_PREFIXES = (
 
 ACTIVE_EDGE_SUBNETS = [
     "172.64.148.0/24",
+    "172.64.150.0/24",
+    "172.64.152.0/24",
     "172.64.154.0/24",
     "172.64.155.0/24",
-    "172.67.74.0/24",
+    "172.66.40.0/24",
+    "172.66.43.0/24",
+    "172.66.44.0/24",
+    "172.66.47.0/24",
     "104.16.132.0/24",
     "104.17.147.0/24",
     "104.18.32.0/24",
+    "104.18.38.0/24",
     "104.18.40.0/24",
+    "104.19.144.0/24",
+    "104.21.48.0/24",
+    "104.24.112.0/24",
     "162.159.135.0/24",
-    "162.159.152.0/24",
+    "162.159.137.0/24",
+    "162.159.140.0/24",
     "188.114.96.0/24",
     "188.114.97.0/24",
-    "108.162.192.0/24",
-    "141.101.90.0/24",
-    "198.41.209.0/24",
+    "188.114.98.0/24",
 ]
 
 SEED_CLEAN_IPS = [
     "172.64.154.159",
     "172.64.155.88",
+    "172.66.40.212",
+    "172.66.43.118",
+    "172.66.44.110",
     "104.18.32.47",
+    "104.18.40.122",
+    "104.19.144.33",
     "162.159.135.42",
+    "162.159.140.98",
     "188.114.96.3",
-    "141.101.90.96",
-    "198.41.209.102",
+    "188.114.97.3",
 ]
 
 CDN_DOMAIN_SUFFIXES = (
@@ -65,6 +80,8 @@ CDN_DOMAIN_SUFFIXES = (
 CLOUDFLARE_HTTP_PORTS = (80, 8080, 8880, 2052, 2082, 2086, 2095)
 CLOUDFLARE_HTTPS_PORTS = (443, 2053, 2083, 2087, 2096, 8443)
 ALL_CLOUDFLARE_PORTS = CLOUDFLARE_HTTPS_PORTS + CLOUDFLARE_HTTP_PORTS
+
+_DOH_CACHE: Dict[str, str] = {}
 
 
 class CleanIpScanner:
@@ -85,6 +102,52 @@ class CleanIpScanner:
         except ValueError:
             return False
 
+    @classmethod
+    def resolve_unpoisoned_ipv4(cls, host: str, timeout: float = 2.0) -> str:
+        clean_h = (host or "").strip().lower()
+        if not clean_h:
+            return ""
+        try:
+            ipaddress.ip_address(clean_h)
+            return clean_h
+        except ValueError:
+            pass
+
+        if clean_h in _DOH_CACHE:
+            return _DOH_CACHE[clean_h]
+
+        try:
+            local_ip = socket.gethostbyname(clean_h)
+            if not cls.is_poisoned_ip(local_ip):
+                _DOH_CACHE[clean_h] = local_ip
+                return local_ip
+        except Exception:
+            pass
+
+        doh_endpoints = (
+            f"https://1.1.1.1/dns-query?name={clean_h}&type=A",
+            f"https://8.8.8.8/resolve?name={clean_h}&type=A",
+            f"https://9.9.9.9:5053/dns-query?name={clean_h}&type=A",
+        )
+        sess = requests.Session()
+        sess.trust_env = False
+        try:
+            for url in doh_endpoints:
+                try:
+                    resp = sess.get(url, headers={"Accept": "application/dns-json"}, timeout=timeout)
+                    if resp.status_code == 200:
+                        for ans in resp.json().get("Answer", []):
+                            if int(ans.get("type", 0)) == 1:
+                                ip_val = str(ans.get("data", "")).strip()
+                                if ip_val and (not cls.is_poisoned_ip(ip_val)):
+                                    _DOH_CACHE[clean_h] = ip_val
+                                    return ip_val
+                except Exception:
+                    continue
+        finally:
+            sess.close()
+        return ""
+
     @staticmethod
     def is_domestic_or_direct_tunnel(node: ProfileNode) -> bool:
         if node.protocol.upper() == "SHADOWSOCKS":
@@ -94,15 +157,15 @@ class CleanIpScanner:
             return True
         return False
 
-    @staticmethod
-    def is_cdn_eligible(node: ProfileNode) -> bool:
+    @classmethod
+    def is_cdn_eligible(cls, node: ProfileNode) -> bool:
         proto_upper = node.protocol.upper()
         uri_lower = node.uri.lower()
         if proto_upper == "SHADOWSOCKS":
             return False
         if "security=reality" in uri_lower:
             return False
-        if "headertype=http" in uri_lower and ("type=tcp" in uri_lower):
+        if ("headertype=http" in uri_lower) and ("type=tcp" in uri_lower):
             return False
 
         host_lower = (node.original_host or "").lower().strip()
@@ -117,23 +180,24 @@ class CleanIpScanner:
             if sni_lower.endswith(sfx) or host_lower.endswith(sfx):
                 return True
 
-        if CleanIpScanner.is_ip_in_cloudflare(node.original_host):
+        if cls.is_ip_in_cloudflare(node.original_host):
             return True
 
-        try:
-            resolved = socket.gethostbyname(node.original_host)
-            if not CleanIpScanner.is_poisoned_ip(resolved):
-                if CleanIpScanner.is_ip_in_cloudflare(resolved):
-                    return True
-        except Exception:
-            return False
+        resolved = cls.resolve_unpoisoned_ipv4(node.original_host, timeout=1.5)
+        if resolved and cls.is_ip_in_cloudflare(resolved):
+            return True
+
+        if sni_lower and (sni_lower != host_lower):
+            resolved_sni = cls.resolve_unpoisoned_ipv4(sni_lower, timeout=1.5)
+            if resolved_sni and cls.is_ip_in_cloudflare(resolved_sni):
+                return True
 
         return False
 
     @staticmethod
-    def generate_candidate_pool(sample_count: int = 40) -> List[str]:
+    def generate_candidate_pool(sample_count: int = 44) -> List[str]:
         candidates = list(SEED_CLEAN_IPS)
-        per_subnet = max(2, (sample_count - len(candidates)) // len(ACTIVE_EDGE_SUBNETS) + 1)
+        per_subnet = max(2, ((sample_count - len(candidates)) // len(ACTIVE_EDGE_SUBNETS)) + 1)
 
         shuffled_subnets = list(ACTIVE_EDGE_SUBNETS)
         random.shuffle(shuffled_subnets)
@@ -152,44 +216,21 @@ class CleanIpScanner:
 
         return candidates[:sample_count]
 
-    @staticmethod
-    def _build_minimal_tls_probe() -> bytes:
-        host = b"cloudflare.com"
-        sni_entry = b"\x00" + struct.pack("!H", len(host)) + host
-        sni_ext = struct.pack("!HH", 0x0000, len(sni_entry) + 2) + struct.pack("!H", len(sni_entry)) + sni_entry
-        sup_ver = struct.pack("!HHBHH", 0x002B, 5, 4, 0x0304, 0x0303)
-        exts = sni_ext + sup_ver
-
-        random_bytes = b"\x11" * 32
-        ciphers = struct.pack("!HHH", 4, 0x1301, 0xC02F)
-        ch_body = (
-            b"\x03\x03"
-            + random_bytes
-            + b"\x00"
-            + ciphers
-            + b"\x01\x00"
-            + struct.pack("!H", len(exts))
-            + exts
-        )
-        hs = b"\x01" + struct.pack("!I", len(ch_body))[1:] + ch_body
-        return b"\x16\x03\x01" + struct.pack("!H", len(hs)) + hs
-
     @classmethod
-    def fast_tcp_ping(cls, host: str, port: int = 443, timeout: float = 1.6) -> int:
+    def fast_tcp_ping(cls, host: str, port: int = 443, timeout: float = 1.5) -> int:
         target = (host or "").strip()
         if not target:
             return -1
-        try:
-            resolved_ip = socket.gethostbyname(target)
-            if cls.is_poisoned_ip(resolved_ip):
-                return -1
-        except Exception:
+
+        resolved_ip = cls.resolve_unpoisoned_ipv4(target, timeout=1.4)
+        if not resolved_ip:
             return -1
 
         t0 = time.perf_counter()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.connect((resolved_ip, int(port)))
             return max(1, int((time.perf_counter() - t0) * 1000))
         except Exception:
@@ -201,36 +242,96 @@ class CleanIpScanner:
                 pass
 
     @classmethod
-    def _deep_edge_verify(cls, ip: str, port: int = 443, timeout: float = 1.8) -> Optional[Tuple[int, int, int, str]]:
-        is_plain_http = int(port) in CLOUDFLARE_HTTP_PORTS
-        probe_pkt = (
-            b"HEAD / HTTP/1.1\r\nHost: cloudflare.com\r\nConnection: close\r\n\r\n"
-            if is_plain_http
-            else cls._build_minimal_tls_probe()
-        )
-        samples = []
+    def _tls_bio_trace_probe(cls, raw_sock: socket.socket, probe_sni: str, req_bytes: bytes) -> bytes:
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+        in_bio = ssl.MemoryBIO()
+        out_bio = ssl.MemoryBIO()
+        ssl_obj = ssl_ctx.wrap_bio(in_bio, out_bio, server_side=False, server_hostname=probe_sni)
 
+        first_flight = True
+        while True:
+            try:
+                ssl_obj.do_handshake()
+                out_pending = out_bio.read()
+                if out_pending:
+                    raw_sock.sendall(out_pending)
+                break
+            except ssl.SSLWantReadError:
+                out_pending = out_bio.read()
+                if out_pending:
+                    if first_flight and (len(out_pending) > 48) and (out_pending[0] == 0x16):
+                        first_flight = False
+                        hs = out_pending[5:]
+                        frames = TlsByteMutator.reframe_handshake_chunks(hs, [37, 24, 32], 0x0303)
+                        raw_sock.sendall(b"".join(frames[:2]))
+                        raw_sock.sendall(b"".join(frames[2:]))
+                    else:
+                        raw_sock.sendall(out_pending)
+                rx_wire = raw_sock.recv(16384)
+                if not rx_wire:
+                    return b""
+                in_bio.write(rx_wire)
+
+        ssl_obj.write(req_bytes)
+        enc_req = out_bio.read()
+        if enc_req:
+            raw_sock.sendall(enc_req)
+
+        plain_buf = bytearray()
+        for _ in range(4):
+            rx_wire = raw_sock.recv(8192)
+            if not rx_wire:
+                break
+            in_bio.write(rx_wire)
+            try:
+                while True:
+                    dec = ssl_obj.read(2048)
+                    if not dec:
+                        break
+                    plain_buf.extend(dec)
+            except ssl.SSLWantReadError:
+                pass
+            if b"fl=" in plain_buf:
+                break
+        return bytes(plain_buf)
+
+    @classmethod
+    def _deep_edge_verify(
+        cls,
+        ip: str,
+        port: int = 443,
+        probe_sni: str = "speed.cloudflare.com",
+        timeout: float = 2.4,
+    ) -> Optional[Tuple[int, int, int, str]]:
+        is_plain_http = int(port) in CLOUDFLARE_HTTP_PORTS
+        sni_host = probe_sni or "speed.cloudflare.com"
+        req_bytes = (
+            f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {sni_host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+        ).encode("ascii", errors="ignore")
+
+        samples: List[int] = []
         for _ in range(2):
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout)
+            raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            raw_sock.settimeout(timeout)
             t0 = time.perf_counter()
             try:
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                sock.connect((ip, int(port)))
-                sock.sendall(probe_pkt)
-                rx = sock.recv(64)
-                if not rx or len(rx) < 5:
-                    return None
-                if is_plain_http and (not rx.startswith(b"HTTP/")):
-                    return None
-                if (not is_plain_http) and (rx[0] not in (0x16, 0x15)):
+                raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                raw_sock.connect((ip, int(port)))
+                if is_plain_http:
+                    raw_sock.sendall(req_bytes)
+                    rx = raw_sock.recv(1024)
+                else:
+                    rx = cls._tls_bio_trace_probe(raw_sock, sni_host, req_bytes)
+                if (not rx) or (b"fl=" not in rx):
                     return None
                 samples.append(max(1, int((time.perf_counter() - t0) * 1000)))
             except Exception:
                 return None
             finally:
                 try:
-                    sock.close()
+                    raw_sock.close()
                 except Exception:
                     pass
 
@@ -244,31 +345,32 @@ class CleanIpScanner:
         cls,
         port: int = 443,
         top_n: int = 5,
-        sample_count: int = 40,
+        sample_count: int = 44,
+        probe_sni: str = "speed.cloudflare.com",
         log_fn: Optional[Callable[[str], None]] = None,
         on_row_cb: Optional[Callable[[dict], None]] = None,
         progress_cb: Optional[Callable[[int, str], None]] = None,
         abort_check: Optional[Callable[[], bool]] = None,
     ) -> List[Tuple[str, int]]:
-        check_port = int(port) if int(port) in ALL_CLOUDFLARE_PORTS else 443
+        check_port = int(port) if (int(port) in ALL_CLOUDFLARE_PORTS) else 443
         pool_ips = cls.generate_candidate_pool(sample_count=sample_count)
         total_pool = max(1, len(pool_ips))
-        if log_fn:
+        if log_fn is not None:
             log_fn(f"[CleanIP] Probing {len(pool_ips)} CIDR edge candidates on port {check_port}...")
 
         tcp_winners: List[Tuple[int, str]] = []
         done_count = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-            fut_map = {executor.submit(cls.fast_tcp_ping, ip, check_port, 1.2): ip for ip in pool_ips}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=22) as executor:
+            fut_map = {executor.submit(cls.fast_tcp_ping, ip, check_port, 1.3): ip for ip in pool_ips}
             for fut in concurrent.futures.as_completed(fut_map):
-                if abort_check and abort_check():
+                if (abort_check is not None) and abort_check():
                     return []
                 done_count += 1
                 rtt = fut.result()
                 ip_val = fut_map[fut]
                 if rtt >= 0:
                     tcp_winners.append((rtt, ip_val))
-                if progress_cb and ((done_count % 4 == 0) or (done_count == total_pool)):
+                if (progress_cb is not None) and ((done_count % 4 == 0) or (done_count == total_pool)):
                     pct = 10 + int((done_count / total_pool) * 50)
                     progress_cb(pct, f"پویش TCP رنج‌های IP تمیز ({done_count}/{total_pool})...")
 
@@ -276,42 +378,42 @@ class CleanIpScanner:
             return []
 
         tcp_winners.sort(key=lambda x: x[0])
-        shortlist = tcp_winners[:12]
+        shortlist = tcp_winners[:14]
         total_short = max(1, len(shortlist))
 
         verified_edges: List[Tuple[int, int, int, str]] = []
         v_done = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             fut_map = {
-                executor.submit(cls._deep_edge_verify, ip, check_port, 1.8): (tcp_ms, ip)
+                executor.submit(cls._deep_edge_verify, ip, check_port, "speed.cloudflare.com", 2.4): (tcp_ms, ip)
                 for tcp_ms, ip in shortlist
             }
             for fut in concurrent.futures.as_completed(fut_map):
-                if abort_check and abort_check():
+                if (abort_check is not None) and abort_check():
                     return []
                 v_done += 1
                 tcp_ms, ip_val = fut_map[fut]
                 res = fut.result()
-                if progress_cb:
+                if progress_cb is not None:
                     pct = 60 + int((v_done / total_short) * 38)
-                    progress_cb(pct, f"راستی‌آزمایی هندشیک و جیتر لبه ({v_done}/{total_short})...")
-                if res:
+                    progress_cb(pct, f"راستی‌آزمایی واقعی لبه CDN ({v_done}/{total_short})...")
+                if res is not None:
                     score, edge_rtt, jitter, _ = res
                     verified_edges.append(res)
-                    if on_row_cb:
+                    if on_row_cb is not None:
                         rank_score = max(5, min(100, 100 - (score // 4)))
                         on_row_cb({
                             "scan_type": "clean_ip",
                             "rank": 0,
                             "item_id": ip_val,
                             "title": ip_val,
-                            "category": "CDN_EDGE",
+                            "category": f"CDN_EDGE:{check_port}",
                             "endpoint": ip_val,
                             "tcp_ms": tcp_ms,
                             "tunnel_ms": edge_rtt,
                             "status": "CLEAN_VERIFIED",
                             "score": rank_score,
-                            "detail": f"Handshake={edge_rtt}ms | Jitter={jitter}ms",
+                            "detail": f"Trace={edge_rtt}ms | Jitter={jitter}ms",
                         })
 
         if not verified_edges:
