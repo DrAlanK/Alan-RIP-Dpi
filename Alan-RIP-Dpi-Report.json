@@ -1,10 +1,10 @@
 {
   "version": "1.4.0",
-  "generated_at_iso": "2026-11-07T05:40:53Z",
-  "generated_at_epoch": 1794030053,
+  "generated_at_iso": "2026-11-07T06:30:24Z",
+  "generated_at_epoch": 1794033024,
   "total_sources": 2,
-  "total_candidates_scanned": 183,
-  "total_verified_exported": 65,
+  "total_candidates_scanned": 225,
+  "total_verified_exported": 66,
   "max_configs_limit": 100,
   "available_locations": [
     {
@@ -12,16 +12,32 @@
       "name_fa": "کانادا",
       "name_en": "Canada",
       "flag": "🇨🇦",
-      "count": 33,
-      "avg_ping_ms": 215
+      "count": 30,
+      "avg_ping_ms": 211
     },
     {
       "code": "DE",
       "name_fa": "آلمان",
       "name_en": "Germany",
       "flag": "🇩🇪",
-      "count": 17,
-      "avg_ping_ms": 335
+      "count": 12,
+      "avg_ping_ms": 222
+    },
+    {
+      "code": "US",
+      "name_fa": "آمریکا",
+      "name_en": "United States",
+      "flag": "🇺🇸",
+      "count": 5,
+      "avg_ping_ms": 387
+    },
+    {
+      "code": "NL",
+      "name_fa": "هلند",
+      "name_en": "Netherlands",
+      "flag": "🇳🇱",
+      "count": 3,
+      "avg_ping_ms": 190
     },
     {
       "code": "JP",
@@ -32,12 +48,12 @@
       "avg_ping_ms": 806
     },
     {
-      "code": "US",
-      "name_fa": "آمریکا",
-      "name_en": "United States",
-      "flag": "🇺🇸",
+      "code": "SG",
+      "name_fa": "سنگاپور",
+      "name_en": "Singapore",
+      "flag": "🇸🇬",
       "count": 2,
-      "avg_ping_ms": 285
+      "avg_ping_ms": 480
     },
     {
       "code": "GB",
@@ -46,14 +62,6 @@
       "flag": "🇬🇧",
       "count": 2,
       "avg_ping_ms": 47
-    },
-    {
-      "code": "NL",
-      "name_fa": "هلند",
-      "name_en": "Netherlands",
-      "flag": "🇳🇱",
-      "count": 2,
-      "avg_ping_ms": 51
     },
     {
       "code": "FR",
@@ -94,6 +102,30 @@
       "flag": "🇱🇹",
       "count": 1,
       "avg_ping_ms": 62
+    },
+    {
+      "code": "ID",
+      "name_fa": "اندونزی",
+      "name_en": "Indonesia",
+      "flag": "🇮🇩",
+      "count": 1,
+      "avg_ping_ms": 198
+    },
+    {
+      "code": "AU",
+      "name_fa": "استرالیا",
+      "name_en": "Australia",
+      "flag": "🇦🇺",
+      "count": 1,
+      "avg_ping_ms": 278
+    },
+    {
+      "code": "SC",
+      "name_fa": "سرور SC",
+      "name_en": "SC",
+      "flag": "🇸🇨",
+      "count": 1,
+      "avg_ping_ms": 721
     }
   ],
   "clean_subnets": [
@@ -107,7 +139,7 @@
     "188.114.97.0/24"
   ],
   "protocol_breakdown": {
-    "VLESS": 52,
+    "VLESS": 53,
     "Trojan": 7,
     "VMess": 6
   }
