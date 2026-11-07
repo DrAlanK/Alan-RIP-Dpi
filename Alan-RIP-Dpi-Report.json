@@ -1,10 +1,10 @@
 {
   "version": "1.4.0",
-  "generated_at_iso": "2026-11-07T01:01:57Z",
-  "generated_at_epoch": 1794013317,
+  "generated_at_iso": "2026-11-07T03:00:15Z",
+  "generated_at_epoch": 1794020415,
   "total_sources": 2,
-  "total_candidates_scanned": 101,
-  "total_verified_exported": 30,
+  "total_candidates_scanned": 142,
+  "total_verified_exported": 29,
   "max_configs_limit": 100,
   "available_locations": [
     {
@@ -12,24 +12,48 @@
       "name_fa": "آلمان",
       "name_en": "Germany",
       "flag": "🇩🇪",
-      "count": 21,
-      "avg_ping_ms": 257
+      "count": 16,
+      "avg_ping_ms": 302
     },
     {
       "code": "CA",
       "name_fa": "کانادا",
       "name_en": "Canada",
       "flag": "🇨🇦",
-      "count": 5,
-      "avg_ping_ms": 508
+      "count": 4,
+      "avg_ping_ms": 410
     },
     {
-      "code": "GB",
-      "name_fa": "انگلیس",
-      "name_en": "United Kingdom",
-      "flag": "🇬🇧",
+      "code": "US",
+      "name_fa": "آمریکا",
+      "name_en": "United States",
+      "flag": "🇺🇸",
+      "count": 3,
+      "avg_ping_ms": 480
+    },
+    {
+      "code": "JP",
+      "name_fa": "ژاپن",
+      "name_en": "Japan",
+      "flag": "🇯🇵",
       "count": 2,
-      "avg_ping_ms": 2073
+      "avg_ping_ms": 1107
+    },
+    {
+      "code": "SG",
+      "name_fa": "سنگاپور",
+      "name_en": "Singapore",
+      "flag": "🇸🇬",
+      "count": 1,
+      "avg_ping_ms": 5
+    },
+    {
+      "code": "SC",
+      "name_fa": "سرور SC",
+      "name_en": "SC",
+      "flag": "🇸🇨",
+      "count": 1,
+      "avg_ping_ms": 459
     },
     {
       "code": "FR",
@@ -37,15 +61,15 @@
       "name_en": "France",
       "flag": "🇫🇷",
       "count": 1,
-      "avg_ping_ms": 148
+      "avg_ping_ms": 802
     },
     {
-      "code": "JP",
-      "name_fa": "ژاپن",
-      "name_en": "Japan",
-      "flag": "🇯🇵",
+      "code": "ID",
+      "name_fa": "اندونزی",
+      "name_en": "Indonesia",
+      "flag": "🇮🇩",
       "count": 1,
-      "avg_ping_ms": 1392
+      "avg_ping_ms": 1249
     }
   ],
   "clean_subnets": [
@@ -59,8 +83,8 @@
     "188.114.97.0/24"
   ],
   "protocol_breakdown": {
-    "VMess": 11,
-    "VLESS": 17,
+    "VMess": 9,
+    "VLESS": 18,
     "Trojan": 2
   }
 }
