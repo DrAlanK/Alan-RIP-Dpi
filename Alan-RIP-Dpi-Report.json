@@ -1,10 +1,10 @@
 {
   "version": "1.4.0",
-  "generated_at_iso": "2026-11-07T00:56:14Z",
-  "generated_at_epoch": 1794012974,
+  "generated_at_iso": "2026-11-07T00:56:47Z",
+  "generated_at_epoch": 1794013007,
   "total_sources": 6,
-  "total_candidates_scanned": 192,
-  "total_verified_exported": 44,
+  "total_candidates_scanned": 216,
+  "total_verified_exported": 50,
   "max_configs_limit": 120,
   "available_locations": [
     {
@@ -12,16 +12,16 @@
       "name_fa": "آلمان",
       "name_en": "Germany",
       "flag": "🇩🇪",
-      "count": 29,
-      "avg_ping_ms": 119
+      "count": 33,
+      "avg_ping_ms": 209
     },
     {
       "code": "US",
       "name_fa": "آمریکا",
       "name_en": "United States",
       "flag": "🇺🇸",
-      "count": 6,
-      "avg_ping_ms": 1223
+      "count": 7,
+      "avg_ping_ms": 1193
     },
     {
       "code": "CA",
@@ -30,6 +30,14 @@
       "flag": "🇨🇦",
       "count": 5,
       "avg_ping_ms": 404
+    },
+    {
+      "code": "IT",
+      "name_fa": "ایتالیا",
+      "name_en": "Italy",
+      "flag": "🇮🇹",
+      "count": 1,
+      "avg_ping_ms": 165
     },
     {
       "code": "AU",
@@ -75,7 +83,7 @@
     "188.114.97.0/24"
   ],
   "protocol_breakdown": {
-    "VLESS": 32,
+    "VLESS": 38,
     "VMess": 11,
     "Trojan": 1
   }
