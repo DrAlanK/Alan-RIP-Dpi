@@ -1,51 +1,43 @@
 {
   "version": "1.4.0",
-  "generated_at_iso": "2026-11-06T23:32:11Z",
-  "generated_at_epoch": 1794007931,
+  "generated_at_iso": "2026-11-07T00:55:27Z",
+  "generated_at_epoch": 1794012927,
   "total_sources": 6,
-  "total_candidates_scanned": 159,
-  "total_verified_exported": 20,
-  "max_configs_limit": 20,
+  "total_candidates_scanned": 172,
+  "total_verified_exported": 38,
+  "max_configs_limit": 120,
   "available_locations": [
     {
       "code": "DE",
       "name_fa": "آلمان",
       "name_en": "Germany",
       "flag": "🇩🇪",
-      "count": 4,
-      "avg_ping_ms": 8
+      "count": 23,
+      "avg_ping_ms": 147
     },
     {
       "code": "US",
       "name_fa": "آمریکا",
       "name_en": "United States",
       "flag": "🇺🇸",
-      "count": 4,
-      "avg_ping_ms": 95
+      "count": 6,
+      "avg_ping_ms": 1223
     },
     {
       "code": "CA",
       "name_fa": "کانادا",
       "name_en": "Canada",
       "flag": "🇨🇦",
-      "count": 4,
-      "avg_ping_ms": 84
+      "count": 5,
+      "avg_ping_ms": 404
     },
     {
       "code": "AU",
       "name_fa": "استرالیا",
       "name_en": "Australia",
       "flag": "🇦🇺",
-      "count": 3,
-      "avg_ping_ms": 531
-    },
-    {
-      "code": "JP",
-      "name_fa": "ژاپن",
-      "name_en": "Japan",
-      "flag": "🇯🇵",
-      "count": 2,
-      "avg_ping_ms": 508
+      "count": 1,
+      "avg_ping_ms": 1012
     },
     {
       "code": "FR",
@@ -53,23 +45,23 @@
       "name_en": "France",
       "flag": "🇫🇷",
       "count": 1,
-      "avg_ping_ms": 125
+      "avg_ping_ms": 1083
     },
     {
-      "code": "SG",
-      "name_fa": "سنگاپور",
-      "name_en": "Singapore",
-      "flag": "🇸🇬",
+      "code": "GB",
+      "name_fa": "انگلیس",
+      "name_en": "United Kingdom",
+      "flag": "🇬🇧",
       "count": 1,
-      "avg_ping_ms": 197
+      "avg_ping_ms": 1187
     },
     {
-      "code": "NL",
-      "name_fa": "هلند",
-      "name_en": "Netherlands",
-      "flag": "🇳🇱",
+      "code": "JP",
+      "name_fa": "ژاپن",
+      "name_en": "Japan",
+      "flag": "🇯🇵",
       "count": 1,
-      "avg_ping_ms": 886
+      "avg_ping_ms": 2211
     }
   ],
   "clean_subnets": [
@@ -83,8 +75,8 @@
     "188.114.97.0/24"
   ],
   "protocol_breakdown": {
-    "VLESS": 13,
-    "VMess": 4,
-    "Trojan": 3
+    "VLESS": 26,
+    "VMess": 11,
+    "Trojan": 1
   }
 }
