@@ -1,10 +1,10 @@
 {
   "version": "1.4.0",
-  "generated_at_iso": "2026-11-07T00:59:08Z",
-  "generated_at_epoch": 1794013148,
+  "generated_at_iso": "2026-11-07T01:01:57Z",
+  "generated_at_epoch": 1794013317,
   "total_sources": 2,
-  "total_candidates_scanned": 30,
-  "total_verified_exported": 20,
+  "total_candidates_scanned": 101,
+  "total_verified_exported": 30,
   "max_configs_limit": 100,
   "available_locations": [
     {
@@ -12,8 +12,16 @@
       "name_fa": "آلمان",
       "name_en": "Germany",
       "flag": "🇩🇪",
-      "count": 15,
-      "avg_ping_ms": 321
+      "count": 21,
+      "avg_ping_ms": 257
+    },
+    {
+      "code": "CA",
+      "name_fa": "کانادا",
+      "name_en": "Canada",
+      "flag": "🇨🇦",
+      "count": 5,
+      "avg_ping_ms": 508
     },
     {
       "code": "GB",
@@ -22,14 +30,6 @@
       "flag": "🇬🇧",
       "count": 2,
       "avg_ping_ms": 2073
-    },
-    {
-      "code": "CA",
-      "name_fa": "کانادا",
-      "name_en": "Canada",
-      "flag": "🇨🇦",
-      "count": 1,
-      "avg_ping_ms": 108
     },
     {
       "code": "FR",
@@ -59,8 +59,8 @@
     "188.114.97.0/24"
   ],
   "protocol_breakdown": {
-    "VMess": 6,
-    "VLESS": 13,
-    "Trojan": 1
+    "VMess": 11,
+    "VLESS": 17,
+    "Trojan": 2
   }
 }
