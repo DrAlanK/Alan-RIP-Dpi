@@ -1,10 +1,10 @@
 {
   "version": "1.4.0",
-  "generated_at_iso": "2026-11-07T12:00:13Z",
-  "generated_at_epoch": 1794052813,
+  "generated_at_iso": "2026-11-07T14:00:15Z",
+  "generated_at_epoch": 1794060015,
   "total_sources": 2,
-  "total_candidates_scanned": 152,
-  "total_verified_exported": 21,
+  "total_candidates_scanned": 144,
+  "total_verified_exported": 17,
   "max_configs_limit": 100,
   "available_locations": [
     {
@@ -13,15 +13,7 @@
       "name_en": "Germany",
       "flag": "🇩🇪",
       "count": 9,
-      "avg_ping_ms": 470
-    },
-    {
-      "code": "CA",
-      "name_fa": "کانادا",
-      "name_en": "Canada",
-      "flag": "🇨🇦",
-      "count": 4,
-      "avg_ping_ms": 589
+      "avg_ping_ms": 201
     },
     {
       "code": "US",
@@ -29,23 +21,7 @@
       "name_en": "United States",
       "flag": "🇺🇸",
       "count": 3,
-      "avg_ping_ms": 638
-    },
-    {
-      "code": "SG",
-      "name_fa": "سنگاپور",
-      "name_en": "Singapore",
-      "flag": "🇸🇬",
-      "count": 1,
-      "avg_ping_ms": 4
-    },
-    {
-      "code": "ID",
-      "name_fa": "اندونزی",
-      "name_en": "Indonesia",
-      "flag": "🇮🇩",
-      "count": 1,
-      "avg_ping_ms": 183
+      "avg_ping_ms": 539
     },
     {
       "code": "NL",
@@ -53,15 +29,23 @@
       "name_en": "Netherlands",
       "flag": "🇳🇱",
       "count": 1,
-      "avg_ping_ms": 599
+      "avg_ping_ms": 89
     },
     {
-      "code": "JP",
-      "name_fa": "ژاپن",
-      "name_en": "Japan",
-      "flag": "🇯🇵",
+      "code": "CA",
+      "name_fa": "کانادا",
+      "name_en": "Canada",
+      "flag": "🇨🇦",
       "count": 1,
-      "avg_ping_ms": 677
+      "avg_ping_ms": 132
+    },
+    {
+      "code": "ID",
+      "name_fa": "اندونزی",
+      "name_en": "Indonesia",
+      "flag": "🇮🇩",
+      "count": 1,
+      "avg_ping_ms": 402
     },
     {
       "code": "FR",
@@ -69,7 +53,15 @@
       "name_en": "France",
       "flag": "🇫🇷",
       "count": 1,
-      "avg_ping_ms": 2435
+      "avg_ping_ms": 408
+    },
+    {
+      "code": "SG",
+      "name_fa": "سنگاپور",
+      "name_en": "Singapore",
+      "flag": "🇸🇬",
+      "count": 1,
+      "avg_ping_ms": 768
     }
   ],
   "clean_subnets": [
@@ -83,8 +75,8 @@
     "188.114.97.0/24"
   ],
   "protocol_breakdown": {
-    "VLESS": 11,
-    "VMess": 8,
+    "VMess": 6,
+    "VLESS": 9,
     "Trojan": 2
   }
 }
