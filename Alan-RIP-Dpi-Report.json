@@ -1,10 +1,10 @@
 {
   "version": "1.4.0",
-  "generated_at_iso": "2026-11-07T00:55:27Z",
-  "generated_at_epoch": 1794012927,
+  "generated_at_iso": "2026-11-07T00:56:14Z",
+  "generated_at_epoch": 1794012974,
   "total_sources": 6,
-  "total_candidates_scanned": 172,
-  "total_verified_exported": 38,
+  "total_candidates_scanned": 192,
+  "total_verified_exported": 44,
   "max_configs_limit": 120,
   "available_locations": [
     {
@@ -12,8 +12,8 @@
       "name_fa": "آلمان",
       "name_en": "Germany",
       "flag": "🇩🇪",
-      "count": 23,
-      "avg_ping_ms": 147
+      "count": 29,
+      "avg_ping_ms": 119
     },
     {
       "code": "US",
@@ -75,7 +75,7 @@
     "188.114.97.0/24"
   ],
   "protocol_breakdown": {
-    "VLESS": 26,
+    "VLESS": 32,
     "VMess": 11,
     "Trojan": 1
   }
