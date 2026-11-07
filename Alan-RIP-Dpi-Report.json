@@ -1,75 +1,99 @@
 {
   "version": "1.4.0",
-  "generated_at_iso": "2026-11-07T03:00:15Z",
-  "generated_at_epoch": 1794020415,
+  "generated_at_iso": "2026-11-07T05:40:53Z",
+  "generated_at_epoch": 1794030053,
   "total_sources": 2,
-  "total_candidates_scanned": 142,
-  "total_verified_exported": 29,
+  "total_candidates_scanned": 183,
+  "total_verified_exported": 65,
   "max_configs_limit": 100,
   "available_locations": [
-    {
-      "code": "DE",
-      "name_fa": "آلمان",
-      "name_en": "Germany",
-      "flag": "🇩🇪",
-      "count": 16,
-      "avg_ping_ms": 302
-    },
     {
       "code": "CA",
       "name_fa": "کانادا",
       "name_en": "Canada",
       "flag": "🇨🇦",
-      "count": 4,
-      "avg_ping_ms": 410
+      "count": 33,
+      "avg_ping_ms": 215
     },
     {
-      "code": "US",
-      "name_fa": "آمریکا",
-      "name_en": "United States",
-      "flag": "🇺🇸",
-      "count": 3,
-      "avg_ping_ms": 480
+      "code": "DE",
+      "name_fa": "آلمان",
+      "name_en": "Germany",
+      "flag": "🇩🇪",
+      "count": 17,
+      "avg_ping_ms": 335
     },
     {
       "code": "JP",
       "name_fa": "ژاپن",
       "name_en": "Japan",
       "flag": "🇯🇵",
+      "count": 3,
+      "avg_ping_ms": 806
+    },
+    {
+      "code": "US",
+      "name_fa": "آمریکا",
+      "name_en": "United States",
+      "flag": "🇺🇸",
       "count": 2,
-      "avg_ping_ms": 1107
+      "avg_ping_ms": 285
     },
     {
-      "code": "SG",
-      "name_fa": "سنگاپور",
-      "name_en": "Singapore",
-      "flag": "🇸🇬",
-      "count": 1,
-      "avg_ping_ms": 5
+      "code": "GB",
+      "name_fa": "انگلیس",
+      "name_en": "United Kingdom",
+      "flag": "🇬🇧",
+      "count": 2,
+      "avg_ping_ms": 47
     },
     {
-      "code": "SC",
-      "name_fa": "سرور SC",
-      "name_en": "SC",
-      "flag": "🇸🇨",
-      "count": 1,
-      "avg_ping_ms": 459
+      "code": "NL",
+      "name_fa": "هلند",
+      "name_en": "Netherlands",
+      "flag": "🇳🇱",
+      "count": 2,
+      "avg_ping_ms": 51
     },
     {
       "code": "FR",
       "name_fa": "فرانسه",
       "name_en": "France",
       "flag": "🇫🇷",
-      "count": 1,
-      "avg_ping_ms": 802
+      "count": 2,
+      "avg_ping_ms": 129
     },
     {
-      "code": "ID",
-      "name_fa": "اندونزی",
-      "name_en": "Indonesia",
-      "flag": "🇮🇩",
+      "code": "GR",
+      "name_fa": "یونان",
+      "name_en": "Greece",
+      "flag": "🇬🇷",
       "count": 1,
-      "avg_ping_ms": 1249
+      "avg_ping_ms": 4
+    },
+    {
+      "code": "SE",
+      "name_fa": "سوئد",
+      "name_en": "Sweden",
+      "flag": "🇸🇪",
+      "count": 1,
+      "avg_ping_ms": 46
+    },
+    {
+      "code": "RU",
+      "name_fa": "روسیه",
+      "name_en": "Russia",
+      "flag": "🇷🇺",
+      "count": 1,
+      "avg_ping_ms": 54
+    },
+    {
+      "code": "LT",
+      "name_fa": "لیتوانی",
+      "name_en": "Lithuania",
+      "flag": "🇱🇹",
+      "count": 1,
+      "avg_ping_ms": 62
     }
   ],
   "clean_subnets": [
@@ -83,8 +107,8 @@
     "188.114.97.0/24"
   ],
   "protocol_breakdown": {
-    "VMess": 9,
-    "VLESS": 18,
-    "Trojan": 2
+    "VLESS": 52,
+    "Trojan": 7,
+    "VMess": 6
   }
 }
